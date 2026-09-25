@@ -1,9 +1,9 @@
 # porchlight
 
-porchlight lets remote MCP clients, like Claude or ChatGPT, use what's running on your computer: an HTTP
-MCP server, a stdio MCP server such as `npx some-mcp-server`, or a command-line program. Each one gets a public URL through
-[OpenTunnel](https://github.com/anomalyco/opentunnel), and every client has to be approved on your computer
-before it can connect.
+porchlight lets Claude, ChatGPT and other remote MCP clients use what's on your computer: MCP servers over
+HTTP or stdio, and plain command-line programs, which porchlight turns into MCP tools with no code. Each app gets
+a public URL through [OpenTunnel](https://github.com/anomalyco/opentunnel), and every client has to be approved
+on your computer before it can connect.
 
 > [!NOTE]
 > porchlight is an experiment. Expect rough edges and breaking changes.

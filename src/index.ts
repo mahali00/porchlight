@@ -49,7 +49,9 @@ const root = Command.make(
   },
   ({ apps, ...input }) => expose({ ...input, targets: apps, json: jsonOutput }),
 ).pipe(
-  Command.withDescription("Share apps on this computer with remote MCP clients. You approve every client."),
+  Command.withDescription(
+    "Share MCP servers and command-line tools on this computer with MCP clients. You approve every client.",
+  ),
   Command.withExamples([
     { command: "porchlight", description: "Pick an app and share it" },
     { command: "porchlight paper --read-only", description: "Share Paper with read-only tools" },
@@ -455,7 +457,7 @@ const commandProblem = (run: ReadonlyArray<string>, allowDangerous = false): str
 };
 
 const appNameProblem = (value: string): string | undefined =>
-  /^[a-z0-9][a-z0-9-]{0,39}$/.test(value) ? undefined : "Use lowercase letters, numbers and -, like my-notes";
+  /^[a-z0-9][a-z0-9-]{0,39}$/.test(value) ? undefined : "Lowercase letters, numbers and - only, like my-notes";
 
 const urlProblem = (value: string): string | undefined => {
   if (!isHttpUrl(value)) return "Enter an http:// or https:// URL";
@@ -610,7 +612,7 @@ const appsAdd = Command.make(
   "add",
   {
     name: Argument.string("name").pipe(
-      Argument.withDescription("App name, also its URL path /<name>/mcp"),
+      Argument.withDescription("Short name, eg: doorbell. It becomes part of the URL"),
       Argument.optional,
     ),
     url: Argument.string("url").pipe(
@@ -643,7 +645,7 @@ const appsAdd = Command.make(
     const given = yield* givenSource(Option.getOrUndefined(input.url), input.command, input.tool, input.allowDangerous);
     const name = Option.isSome(input.name)
       ? input.name.value
-      : yield* askOrFail("a name", addUsage, askText("App name, also its URL path /<name>/mcp", appNameProblem));
+      : yield* askOrFail("a name", addUsage, askText("Give it a short name, eg: doorbell", appNameProblem));
     const settings = yield* loadSettings();
     const existing = settings.servers?.[name];
     const found = (yield* discover(settings.servers)).some((server) => server.name === name);

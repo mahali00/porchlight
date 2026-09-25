@@ -1,6 +1,6 @@
 # AGENTS.md
 
-porchlight exposes local MCP servers to cloud MCP clients through a tunnel. It is a **Bun** CLI, not a Node app.
+porchlight shares local MCP servers (HTTP or stdio) and plain command-line programs, wrapped as MCP tools, with remote MCP clients through a tunnel. It is a **Bun** CLI, not a Node app.
 
 ## Commands
 

@@ -1,7 +1,7 @@
 {
   "name": "porchlight",
   "version": "0.1.0",
-  "description": "Expose local MCP servers to cloud MCP clients with one command.",
+  "description": "Share MCP servers and command-line tools on your computer with Claude and other MCP clients. You approve every client.",
   "keywords": [
     "mcp",
     "model-context-protocol",
