@@ -1,0 +1,67 @@
+[package]
+name = "porchlight"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.9"
+base64 = "0.23.1"
+bytes = "1.12.1"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+form_urlencoded = "1.2.2"
+futures = "0.3.34"
+gethostname = "1.1.0"
+hmac = "0.13.0"
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = "1.11.1"
+hyper-util = "0.1.21"
+indexmap = { version = "2.14.2", features = ["serde"] }
+jsonc-parser = { version = "0.33.2", features = ["cst", "serde"] }
+maud = "0.27.0"
+nix = { version = "0.31.3", features = ["signal", "process"] }
+rand = "0.10.3"
+ratatui = "0.30.2"
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "json"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.11.0"
+subtle = "2.6.1"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tokio-util = "0.7.19"
+unicode-width = "0.2.2"
+url = "2.5.8"
+which = "8.0.6"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+as_conversions = "deny"
+string_slice = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+strip = true
+lto = true
+
+[dev-dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "form", "query", "json", "stream"] }

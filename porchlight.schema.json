@@ -1,0 +1,473 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "porchlight.json",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "tunnel": {
+      "type": "string",
+      "description": "How MCP clients reach this computer: \"opentunnel\" or an HTTPS URL"
+    },
+    "port": {
+      "type": "integer",
+      "allOf": [
+        {
+          "description": "Local port the tunnel forwards to"
+        }
+      ]
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "Streamable HTTP URL of the MCP server"
+              },
+              "headers": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Headers sent to this server only. {env:NAME} and {file:path} work."
+              },
+              "enabled": {
+                "type": "boolean",
+                "description": "false keeps it here without running it"
+              },
+              "allowDangerous": {
+                "type": "boolean",
+                "description": "Share it even if it has tools that can run shell commands or code"
+              }
+            },
+            "required": [
+              "url"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "command": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ],
+                "description": "Command that starts a stdio MCP server"
+              },
+              "environment": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Environment for the server. {env:NAME} and {file:path} work."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Folder the server runs in"
+              },
+              "enabled": {
+                "type": "boolean",
+                "description": "false keeps it here without running it"
+              },
+              "allowDangerous": {
+                "type": "boolean",
+                "description": "Share it even if it has tools that can run shell commands or code"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "description": "MCP servers on this computer, by name"
+    },
+    "commands": {
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "run": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ],
+                "description": "The command, like \"garage open\". {name} is filled in by the client."
+              },
+              "description": {
+                "type": "string",
+                "description": "What the tool does, shown to the client"
+              },
+              "readOnly": {
+                "type": "boolean",
+                "description": "It only reads, never changes anything"
+              },
+              "resource": {
+                "type": "boolean",
+                "description": "Share its output as a resource the client reads, instead of a tool it calls"
+              },
+              "inputs": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "integer",
+                        "number",
+                        "boolean"
+                      ],
+                      "description": "What kind of value it takes (string by default)"
+                    },
+                    "description": {
+                      "type": "string",
+                      "description": "What to fill in, shown to the client"
+                    },
+                    "choices": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "The only values allowed"
+                    },
+                    "min": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": [
+                            "NaN"
+                          ]
+                        },
+                        {
+                          "type": "string",
+                          "enum": [
+                            "Infinity"
+                          ]
+                        },
+                        {
+                          "type": "string",
+                          "enum": [
+                            "-Infinity"
+                          ]
+                        }
+                      ],
+                      "description": "Smallest number allowed"
+                    },
+                    "max": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": [
+                            "NaN"
+                          ]
+                        },
+                        {
+                          "type": "string",
+                          "enum": [
+                            "Infinity"
+                          ]
+                        },
+                        {
+                          "type": "string",
+                          "enum": [
+                            "-Infinity"
+                          ]
+                        }
+                      ],
+                      "description": "Largest number allowed"
+                    },
+                    "optional": {
+                      "type": "boolean",
+                      "description": "The client may leave it out, which drops its word from the command"
+                    },
+                    "flag": {
+                      "type": "string",
+                      "allOf": [
+                        {
+                          "pattern": "^-",
+                          "description": "For a boolean: the flag added when it is true, like --verbose"
+                        }
+                      ]
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "description": "Describe or limit each {name}"
+              },
+              "environment": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Environment for the command. {env:NAME} and {file:path} work."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Folder the command runs in"
+              },
+              "allowDangerous": {
+                "type": "boolean",
+                "description": "Share it even if it hands client input to a shell or interpreter"
+              }
+            },
+            "required": [
+              "run"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string",
+                "description": "What this group of tools is for"
+              },
+              "environment": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Environment for the command. {env:NAME} and {file:path} work."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Folder the command runs in"
+              },
+              "allowDangerous": {
+                "type": "boolean",
+                "description": "Share it even if it hands client input to a shell or interpreter"
+              }
+            },
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "run": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      ],
+                      "description": "The command, like \"garage open\". {name} is filled in by the client."
+                    },
+                    "description": {
+                      "type": "string",
+                      "description": "What the tool does, shown to the client"
+                    },
+                    "readOnly": {
+                      "type": "boolean",
+                      "description": "It only reads, never changes anything"
+                    },
+                    "resource": {
+                      "type": "boolean",
+                      "description": "Share its output as a resource the client reads, instead of a tool it calls"
+                    },
+                    "inputs": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "type": {
+                            "type": "string",
+                            "enum": [
+                              "string",
+                              "integer",
+                              "number",
+                              "boolean"
+                            ],
+                            "description": "What kind of value it takes (string by default)"
+                          },
+                          "description": {
+                            "type": "string",
+                            "description": "What to fill in, shown to the client"
+                          },
+                          "choices": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "The only values allowed"
+                          },
+                          "min": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string",
+                                "enum": [
+                                  "NaN"
+                                ]
+                              },
+                              {
+                                "type": "string",
+                                "enum": [
+                                  "Infinity"
+                                ]
+                              },
+                              {
+                                "type": "string",
+                                "enum": [
+                                  "-Infinity"
+                                ]
+                              }
+                            ],
+                            "description": "Smallest number allowed"
+                          },
+                          "max": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string",
+                                "enum": [
+                                  "NaN"
+                                ]
+                              },
+                              {
+                                "type": "string",
+                                "enum": [
+                                  "Infinity"
+                                ]
+                              },
+                              {
+                                "type": "string",
+                                "enum": [
+                                  "-Infinity"
+                                ]
+                              }
+                            ],
+                            "description": "Largest number allowed"
+                          },
+                          "optional": {
+                            "type": "boolean",
+                            "description": "The client may leave it out, which drops its word from the command"
+                          },
+                          "flag": {
+                            "type": "string",
+                            "allOf": [
+                              {
+                                "pattern": "^-",
+                                "description": "For a boolean: the flag added when it is true, like --verbose"
+                              }
+                            ]
+                          }
+                        },
+                        "additionalProperties": false
+                      },
+                      "description": "Describe or limit each {name}"
+                    },
+                    "environment": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Environment for the command. {env:NAME} and {file:path} work."
+                    },
+                    "cwd": {
+                      "type": "string",
+                      "description": "Folder the command runs in"
+                    },
+                    "allowDangerous": {
+                      "type": "boolean",
+                      "description": "Share it even if it hands client input to a shell or interpreter"
+                    }
+                  },
+                  "required": [
+                    "run"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "type": "boolean"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "description": "Command-line programs to share as tools, by name"
+    },
+    "tools": {
+      "type": "object",
+      "patternProperties": {
+        "^[^/]+\\/[^/]+$": {
+          "type": "boolean"
+        }
+      },
+      "description": "Turn tools on or off with \"app/tool\" patterns, like \"paper/delete_*\": false. The last match wins."
+    },
+    "links": {
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "string",
+            "enum": [
+              "*"
+            ]
+          }
+        ]
+      },
+      "description": "Named command-tool links. List command app names, or use \"*\" for every command app."
+    }
+  },
+  "additionalProperties": false
+}

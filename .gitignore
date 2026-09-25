@@ -1,0 +1,5 @@
+.env
+.env.*
+.DS_Store
+.audit/
+/target

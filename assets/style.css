@@ -1,0 +1,603 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0906;
+  --fg: #f2e2c4;
+  --dim: #8c7657;
+  --faint: #5a4830;
+  --rule: #2e2418;
+  --lamp: #ffb547;
+  --on-lamp: #0b0906;
+  --danger: #e5553f;
+  --ok: #ffb547;
+  --warn: #e3c48e;
+  --wash: #1a1209;
+  --well: #150f08;
+  --x: 96px;
+  --y: 56px;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  padding: 40px 64px 80px;
+  background: var(--bg);
+  color: var(--fg);
+  font:
+    15px/1.6 ui-monospace,
+    "SF Mono",
+    Menlo,
+    Consolas,
+    monospace;
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  max-width: 800px;
+  margin-inline: auto;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--rule);
+}
+.mark,
+h1 {
+  font-family: Impact, Haettenschweiler, "Arial Narrow Bold", sans-serif;
+  font-weight: normal;
+}
+.mark {
+  font-size: 28px;
+  line-height: 32px;
+  color: var(--lamp);
+  text-shadow: 0 0 18px color-mix(in srgb, var(--lamp) 55%, transparent);
+}
+.label,
+header small,
+dt {
+  font-size: 12px;
+  line-height: 16px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+main {
+  display: flex;
+  flex-direction: column;
+  gap: 36px;
+  max-width: 800px;
+  margin-inline: auto;
+  padding-top: 64px;
+}
+hgroup {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+h1 {
+  margin: 0;
+  font-size: 56px;
+  line-height: 60px;
+  overflow-wrap: anywhere;
+}
+p {
+  margin: 0;
+}
+.path {
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+}
+.path span {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border: 1px solid var(--fg);
+}
+.path span.unverified {
+  border: 1px dashed var(--warn);
+}
+.path i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--fg);
+}
+.path .unverified i {
+  background: var(--warn);
+}
+.path i.live {
+  background: var(--ok);
+}
+.path i.starting {
+  background: none;
+  border: 1.5px solid var(--dim);
+}
+.path .wire {
+  position: relative;
+  width: 72px;
+  border-top: 1px dashed var(--dim);
+}
+.path .wire::after {
+  content: "";
+  position: absolute;
+  top: -2px;
+  left: 0;
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--fg);
+  box-shadow: 0 0 8px 2px var(--fg);
+  opacity: 0;
+  animation: travel-in 3.2s linear infinite;
+}
+.path b + .wire::after {
+  animation-name: travel-out;
+}
+.path span:first-child i {
+  animation: depart 3.2s ease-out infinite;
+}
+.path b {
+  animation: shield 3.2s ease-out infinite;
+}
+.path span:last-child {
+  animation: arrive 3.2s ease-out infinite;
+}
+@keyframes depart {
+  0%,
+  12% {
+    box-shadow: 0 0 10px 3px currentColor;
+  }
+  24%,
+  100% {
+    box-shadow: none;
+  }
+}
+@keyframes travel-in {
+  0%,
+  6% {
+    left: 0;
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  34% {
+    left: calc(100% - 14px);
+    opacity: 1;
+  }
+  38%,
+  100% {
+    left: calc(100% - 14px);
+    opacity: 0;
+  }
+}
+@keyframes shield {
+  0%,
+  36% {
+    box-shadow: 0 0 0 10px var(--lamp);
+  }
+  44% {
+    box-shadow:
+      0 0 0 10px var(--lamp),
+      0 0 26px 16px color-mix(in srgb, var(--lamp) 55%, transparent);
+  }
+  60%,
+  100% {
+    box-shadow: 0 0 0 10px var(--lamp);
+  }
+}
+@keyframes travel-out {
+  0%,
+  48% {
+    left: 0;
+    opacity: 0;
+  }
+  52% {
+    opacity: 1;
+  }
+  76% {
+    left: calc(100% - 14px);
+    opacity: 1;
+  }
+  80%,
+  100% {
+    left: calc(100% - 14px);
+    opacity: 0;
+  }
+}
+@keyframes arrive {
+  0%,
+  76% {
+    box-shadow: none;
+  }
+  84% {
+    box-shadow: 0 0 24px 4px color-mix(in srgb, var(--ok) 60%, transparent);
+  }
+  100% {
+    box-shadow: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .path *,
+  .path *::after {
+    animation: none !important;
+  }
+}
+.path b {
+  width: 16px;
+  height: 16px;
+  margin-inline: 10px;
+  border-radius: 50%;
+  background: var(--lamp);
+  box-shadow: 0 0 0 10px var(--lamp);
+}
+dl {
+  margin: 0;
+  border-top: 1px solid var(--rule);
+}
+dl div {
+  display: flex;
+  align-items: center;
+  min-height: 56px;
+  border-bottom: 1px solid var(--rule);
+}
+dt {
+  width: 160px;
+  flex-shrink: 0;
+}
+dd {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+.badge {
+  padding: 2px 8px;
+  border: 1px solid;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.badge.verified {
+  color: var(--ok);
+}
+.badge.unverified {
+  color: var(--warn);
+}
+.warning {
+  padding: 18px 20px;
+  border-left: 3px solid var(--warn);
+  background: var(--wash);
+  font-size: 14px;
+}
+.warning strong {
+  display: block;
+  color: var(--warn);
+  font-weight: 500;
+}
+form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 14px;
+}
+.buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+button {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 18px 24px;
+  border: 1px solid var(--fg);
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+.primary {
+  min-width: 200px;
+  border-color: var(--lamp);
+  background: var(--lamp);
+  color: var(--on-lamp);
+  box-shadow: 0 0 24px color-mix(in srgb, var(--lamp) 30%, transparent);
+}
+.wide {
+  min-width: 360px;
+}
+.note,
+.local {
+  font-size: 13px;
+  color: var(--dim);
+}
+details,
+.local {
+  padding-top: 24px;
+  border-top: 1px dashed var(--rule);
+}
+summary {
+  cursor: pointer;
+  list-style: none;
+}
+summary::-webkit-details-marker {
+  display: none;
+}
+summary::before {
+  content: "▸ ";
+}
+details[open] summary::before {
+  content: "▾ ";
+}
+summary span {
+  color: var(--dim);
+}
+ol {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: 28px 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+ol li {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  counter-increment: step;
+}
+ol li::before {
+  content: counter(step);
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border: 1px solid var(--dim);
+  border-radius: 50%;
+  font-size: 12px;
+}
+code {
+  padding: 2px 8px;
+  background: var(--well);
+}
+.entry {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: stretch;
+  padding-left: 38px;
+}
+.entry input {
+  width: 14ch;
+  padding: 14px 16px;
+  border: 1px solid var(--dim);
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+.entry input:focus {
+  outline: 2px solid var(--lamp);
+  outline-offset: -1px;
+}
+.tools ul {
+  columns: 2;
+  margin: 20px 0 0;
+  padding: 0;
+  list-style: none;
+  line-height: 2;
+}
+.tools .danger {
+  color: var(--danger);
+}
+.status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.status::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+.status.wait::before {
+  background: var(--warn);
+}
+.detail {
+  max-width: 560px;
+  font-size: 16px;
+}
+.next {
+  display: flex;
+  padding-top: 28px;
+  border-top: 1px solid var(--rule);
+  overflow-wrap: anywhere;
+}
+.next .label {
+  width: 160px;
+  flex-shrink: 0;
+  padding-top: 3px;
+}
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    520px circle at var(--x) var(--y),
+    color-mix(in srgb, var(--lamp) 16%, transparent),
+    color-mix(in srgb, var(--lamp) 5%, transparent) 45%,
+    transparent 70%
+  );
+}
+header,
+main {
+  position: relative;
+}
+section h2 {
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-weight: normal;
+  margin: 0 0 12px;
+}
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--rule);
+}
+.rows > li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  min-height: 56px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--rule);
+  box-shadow: inset 0 0 var(--lamp);
+  transition: box-shadow 0.2s;
+}
+.rows > li:hover {
+  background: radial-gradient(
+      360px circle at var(--x) var(--y),
+      color-mix(in srgb, var(--lamp) 14%, transparent),
+      transparent 75%
+    )
+    fixed;
+  box-shadow: inset 3px 0 var(--lamp);
+}
+.rows small {
+  color: var(--dim);
+}
+.rows span {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.rows strong {
+  font-weight: 500;
+}
+.rows i {
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.rows i.live {
+  background: var(--lamp);
+  box-shadow: 0 0 10px 1px var(--lamp);
+}
+.rows i.refused {
+  background: var(--danger);
+}
+.rows code {
+  background: none;
+  padding: 0;
+  font-size: 13px;
+  color: var(--dim);
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+.rows > li:hover code {
+  color: var(--fg);
+}
+.rows form {
+  margin: 0;
+}
+.rows button {
+  font-size: 12px;
+  font-weight: normal;
+  padding: 4px 12px;
+  border-color: var(--rule);
+  color: var(--dim);
+}
+.rows button:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.waiting {
+  border-top-color: var(--lamp);
+}
+.waiting .primary {
+  min-width: 0;
+  padding: 8px 16px;
+  text-decoration: none;
+}
+.bad {
+  color: var(--danger);
+}
+.home {
+  gap: 48px;
+}
+.home .local {
+  border-top: none;
+  padding-top: 0;
+}
+@media (max-width: 600px) {
+  body {
+    padding: 24px 20px 40px;
+  }
+  main {
+    padding-top: 40px;
+    gap: 28px;
+  }
+  h1 {
+    font-size: 36px;
+    line-height: 40px;
+  }
+  .path {
+    display: none;
+  }
+  dl div,
+  .next {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 14px 0;
+  }
+  .next {
+    padding-top: 20px;
+  }
+  form,
+  .buttons {
+    align-items: stretch;
+    width: 100%;
+  }
+  button,
+  .wide {
+    width: 100%;
+    min-width: 0;
+  }
+  .entry {
+    flex-direction: column;
+    padding-left: 0;
+  }
+  .entry input {
+    width: 100%;
+  }
+  .connect .approve {
+    order: 1;
+  }
+  .connect .approve .primary {
+    border-color: var(--rule);
+    background: none;
+    color: var(--fg);
+  }
+  .tools ul {
+    columns: 1;
+  }
+}

@@ -1,0 +1,2 @@
+[env]
+PORCHLIGHT_HOME = { value = "target/dev-home", relative = true }
