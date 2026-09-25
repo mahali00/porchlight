@@ -1,0 +1,57 @@
+{
+  "name": "porchlight",
+  "version": "0.1.0",
+  "description": "Expose local MCP servers to cloud MCP clients with one command.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "tunnel",
+    "oauth",
+    "opentunnel",
+    "bun"
+  ],
+  "license": "MIT",
+  "author": "mahali00",
+  "homepage": "https://github.com/mahali00/porchlight#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mahali00/porchlight.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mahali00/porchlight/issues"
+  },
+  "type": "module",
+  "bin": {
+    "porchlight": "src/index.ts"
+  },
+  "files": [
+    "src",
+    "porchlight.schema.json"
+  ],
+  "engines": {
+    "bun": ">=1.4.2"
+  },
+  "scripts": {
+    "start": "bun src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p .",
+    "format": "prettier --write src tests",
+    "check": "tsc --noEmit -p . && prettier --check src tests && bun test",
+    "build": "tsc --noEmit -p . && bun build --compile src/index.ts --outfile dist/porchlight",
+    "schema": "bun script/schema.ts"
+  },
+  "dependencies": {
+    "@effect/platform-node": "4.0.0-beta.42",
+    "@effect/platform-node-shared": "4.0.0-beta.42",
+    "effect": "4.0.0-beta.42"
+  },
+  "overrides": {
+    "@effect/platform-node-shared": "4.0.0-beta.42"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "prettier": "3.9.9",
+    "typescript": "7.0.2"
+  }
+}

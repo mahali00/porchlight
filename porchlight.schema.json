@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "porchlight.json",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "tunnel": {
+      "type": "string",
+      "description": "How MCP clients reach this computer: \"opentunnel\" or your own HTTPS URL"
+    },
+    "port": {
+      "type": "integer",
+      "allOf": [
+        {
+          "description": "Local port the tunnel forwards to"
+        }
+      ]
+    },
+    "keepAwake": {
+      "type": "boolean",
+      "description": "Keep the Mac awake while sharing"
+    },
+    "allow": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Only share these tools"
+    },
+    "deny": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Hide these tools"
+    },
+    "readOnly": {
+      "type": "boolean",
+      "description": "Only share tools marked read-only"
+    },
+    "servers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Streamable HTTP URL of the local MCP server"
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Command that starts a stdio MCP server, as a list of words"
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Environment for its commands. ${VAR} reads an environment variable."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Working folder for its commands"
+          },
+          "tools": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "run": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Command and its arguments, like [\"garage\", \"open\"]. An argument like \"{room}\" is filled in by the client."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "What the tool does, shown to the client"
+                },
+                "readOnly": {
+                  "type": "boolean",
+                  "description": "It only reads, never changes anything"
+                },
+                "inputs": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                      "description": {
+                        "type": "string",
+                        "description": "What to fill in, shown to the client"
+                      },
+                      "choices": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "The only values allowed"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "description": "Describe or limit each {input}, by name"
+                }
+              },
+              "required": [
+                "run"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Command-line commands to share as tools, by name"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Headers sent to this server only. ${VAR} reads an environment variable."
+          },
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Only share these tools"
+          },
+          "deny": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Hide these tools"
+          },
+          "readOnly": {
+            "type": "boolean",
+            "description": "Only share tools marked read-only"
+          },
+          "allowDangerous": {
+            "type": "boolean",
+            "description": "Expose this server even if it has shell-like tools"
+          }
+        },
+        "additionalProperties": false
+      },
+      "description": "Settings for one server, by name"
+    }
+  },
+  "additionalProperties": false
+}
