@@ -62,7 +62,7 @@ fn a_pending_request_always_has_a_code_and_a_wrong_code_is_refused() {
     let nonce = begin(&auth, "wrong-code").unwrap();
     let code = auth.store().pending_get("wrong-code").unwrap().unwrap().code;
 
-    assert!(!code.is_empty());
+    assert_ne!(code, "");
     assert_eq!(refusal(auth.approve_with_code("wrong-code", "WRONG123", Some(&nonce))), "Invalid code");
     assert_eq!(
         auth.approve_with_code("wrong-code", &code, Some(&nonce)).unwrap().redirect_uri,
@@ -347,7 +347,7 @@ fn a_value_read_from_the_environment_or_a_file_never_becomes_client_input() {
     let tool = &compiled.specs[0].source.contribution().unwrap().tools["leak"];
     let values = json!({ "words": "hi" });
 
-    assert!(compiled.problems.is_empty());
+    assert_eq!(compiled.problems, []);
     assert_eq!(inputs_of(&tool.words), ["words"]);
     assert_eq!(fill(&tool.words, values.as_object().unwrap(), &IndexMap::new())[1..], ["{cmd}", "{other}", "hi"]);
 }
@@ -390,7 +390,7 @@ fn named_links_overlap_and_the_wildcard_selects_every_command_app() {
     let plans: Vec<(String, String)> =
         compiled.links.iter().map(|plan| (plan.name().to_owned(), plan.signature())).collect();
 
-    assert!(compiled.problems.is_empty());
+    assert_eq!(compiled.problems, []);
     assert_eq!(
         plans,
         [
@@ -587,7 +587,7 @@ fn a_destructive_command_is_never_announced_as_read_only() {
 fn a_resource_cant_be_a_destructive_command() {
     let compiled = compile(&json!({ "t": { "run": "rm -rf /tmp/box", "resource": true } }));
 
-    assert!(compiled.specs.is_empty());
+    assert_eq!(compiled.specs, []);
     assert!(compiled.problems.iter().any(|problem| problem.message.contains("deletes files")));
 }
 
@@ -648,7 +648,7 @@ fn a_non_executable_program_path_is_rejected_while_compiling() {
     std::fs::write(&file, "echo no").unwrap();
     let compiled = compile(&json!({ "blocked": file.display().to_string() }));
 
-    assert!(compiled.specs.is_empty());
+    assert_eq!(compiled.specs, []);
     assert_eq!(compiled.problems.len(), 1);
 }
 
@@ -667,7 +667,7 @@ fn an_optional_input_cant_sit_right_after_an_option() {
     let compiled =
         compile(&json!({ "t": { "run": "printf %s -o {out} {file}", "inputs": { "out": { "optional": true } } } }));
 
-    assert!(compiled.specs.is_empty());
+    assert_eq!(compiled.specs, []);
     assert_eq!(compiled.problems.len(), 1);
 }
 
@@ -761,7 +761,7 @@ fn upgrading_the_database_preserves_access_and_history_but_ends_old_pending_requ
     assert!(store.grant_exists("grant").unwrap());
     assert!(store.token_get("token-hash").unwrap().is_some());
     assert_eq!(store.client_name("client").unwrap(), "Existing client");
-    assert!(store.pending_list().unwrap().is_empty());
+    assert_eq!(store.pending_list().unwrap(), []);
     drop(store);
     let connection = rusqlite::Connection::open(&path).unwrap();
     let count: i64 = connection

@@ -367,7 +367,7 @@ mod tests {
 
         reloader.reload_with("bad-config-fingerprint".to_owned()).await;
 
-        assert!(reloader.seen.lock().unwrap().is_empty());
+        assert_eq!(reloader.seen.lock().unwrap().as_str(), "");
         std::fs::remove_file(path).unwrap();
     }
 }

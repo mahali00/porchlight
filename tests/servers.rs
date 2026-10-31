@@ -1215,7 +1215,7 @@ async fn upstream_tool_names_outside_mcp_guidance_are_reported_hidden_and_refuse
     let called = harness.json("dynamic", "tools/call", json!({ "name": "files/read" })).await;
 
     assert!(entry.detail.contains("files/read"));
-    assert!(entry.tools.is_empty());
+    assert_eq!(entry.tools, []);
     assert!(!listed.contains("files/read"));
     assert_eq!(called["error"]["code"], -32602);
 }
