@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='porchlight-install-') as directory:
     checksum.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + filename + '\n')
     commands = root / 'commands'
     commands.mkdir()
-    for name in ['sh', 'uname', 'sysctl', 'mktemp', 'rm', 'cut', 'sha256sum', 'shasum', 'tar', 'mkdir', 'cp', 'chmod', 'mv']:
+    for name in ['sh', 'uname', 'sysctl', 'mktemp', 'rm', 'cut', 'sha256sum', 'shasum', 'tar', 'gzip', 'mkdir', 'cp', 'chmod', 'mv']:
         found = shutil.which(name)
         if found:
             (commands / name).symlink_to(found)
