@@ -1,5 +1,5 @@
 use super::{TunnelError, TunnelWarning, days_until};
-use crate::config::log_dir;
+use crate::core::log_dir;
 use chrono::{DateTime, Utc};
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
@@ -11,7 +11,8 @@ use tokio::task::JoinHandle;
 
 const ROUTE: &str = "porchlight";
 
-const MISSING: &str = "OpenTunnel isn't installed. Run `bun add -g opentunnel` or `npm i -g opentunnel`.";
+const MISSING: &str =
+    "OpenTunnel 0.5.0 isn't installed. Run `bun add -g opentunnel@0.5.0` or `npm i -g opentunnel@0.5.0`.";
 
 async fn npm_global_bin() -> Option<PathBuf> {
     let output = Command::new("npm").args(["prefix", "-g"]).output().await.ok()?;
@@ -36,16 +37,15 @@ pub async fn find() -> Option<PathBuf> {
     npm_global_bin().await.filter(|path| path.exists())
 }
 
-pub async fn install(quiet: bool) -> bool {
-    let installers: [(&str, &[&str]); 2] = [("bun", &["add", "-g", "opentunnel"]), ("npm", &["i", "-g", "opentunnel"])];
+pub async fn install() -> bool {
+    let installers: [(&str, &[&str]); 2] =
+        [("bun", &["add", "-g", "opentunnel@0.5.0"]), ("npm", &["i", "-g", "opentunnel@0.5.0"])];
 
     for (program, args) in installers {
         let Ok(path) = which::which(program) else {
             continue;
         };
-        let (stdout, stderr) =
-            if quiet { (Stdio::null(), Stdio::null()) } else { (Stdio::inherit(), Stdio::inherit()) };
-        let status = Command::new(path).args(args).stdout(stdout).stderr(stderr).status().await;
+        let status = Command::new(path).args(args).stdout(Stdio::inherit()).stderr(Stdio::inherit()).status().await;
 
         if status.is_ok_and(|status| status.success()) && find().await.is_some() {
             return true;
@@ -114,16 +114,31 @@ async fn ensure_tunnel() -> Result<(), TunnelError> {
     Ok(())
 }
 
+fn route_matches(routes: &str, target: &str) -> bool {
+    routes.lines().any(|line| {
+        let mut route = false;
+        let mut local_target = false;
+
+        for column in line.split_whitespace() {
+            let token = column
+                .trim_matches(|char: char| !char.is_ascii_alphanumeric() && char != '.' && char != ':' && char != '-');
+            route |= token.starts_with("porchlight.");
+            local_target |= token == target;
+        }
+
+        route && local_target
+    })
+}
+
 async fn ensure_route(local_port: u16) -> Result<(), TunnelError> {
     let target = format!("127.0.0.1:{local_port}");
     let routes = run(&["route", "list"]).await?;
-    let has_route = routes.contains(&format!("{ROUTE}."));
 
-    if has_route && routes.contains(&target) {
+    if route_matches(&routes, &target) {
         return Ok(());
     }
 
-    if has_route {
+    if routes.lines().any(|line| line.split_whitespace().any(|column| column.starts_with("porchlight."))) {
         run(&["route", "remove", ROUTE]).await?;
     }
 
@@ -188,23 +203,27 @@ impl OpenTunnel {
 pub async fn open(local_port: u16) -> Result<OpenTunnel, TunnelError> {
     ensure_tunnel().await?;
     ensure_route(local_port).await?;
-    let details = run(&["info"]).await?;
-    let tunnel_url =
-        parse_public_url(&details).ok_or_else(|| TunnelError::new("opentunnel info did not print a hostname"))?;
+    let result = async {
+        let details = run(&["info"]).await?;
+        let tunnel_url =
+            parse_public_url(&details).ok_or_else(|| TunnelError::new("opentunnel info did not print a hostname"))?;
+        if let Some(days) = parse_certificate_expiry(&details).map(|expiry| days_until(expiry, Utc::now()))
+            && days < 7
+        {
+            eprintln!("! Check OpenTunnel's certificate: it expires in {} days.", days.max(0));
+        }
+        Ok(OpenTunnel {
+            public_url: tunnel_url.replacen("https://", &format!("https://{ROUTE}."), 1),
+            serving: tokio::spawn(keep_serving()),
+        })
+    }
+    .await;
 
-    if let Some(days) = parse_certificate_expiry(&details).map(|expiry| days_until(expiry, Utc::now()))
-        && days < 14
-    {
-        eprintln!(
-            "! OpenTunnel's certificate expires in {} days, and OpenTunnel doesn't renew it yet. Use your own tunnel for an address that has to last: `porchlight tunnel use <https-url>`.",
-            days.max(0)
-        );
+    if result.is_err() {
+        let _ = run(&["route", "remove", ROUTE]).await;
     }
 
-    Ok(OpenTunnel {
-        public_url: tunnel_url.replacen("https://", &format!("https://{ROUTE}."), 1),
-        serving: tokio::spawn(keep_serving()),
-    })
+    result
 }
 
 pub async fn warnings() -> Vec<TunnelWarning> {
@@ -213,14 +232,27 @@ pub async fn warnings() -> Vec<TunnelWarning> {
     };
     let days = days_until(expiry, Utc::now());
 
-    [14, 7, 1]
-        .into_iter()
-        .filter(|limit| days <= *limit)
-        .map(|limit| TunnelWarning {
-            id: format!("certificate-{limit}"),
-            message: format!(
-                "The OpenTunnel certificate expires in {days} days and doesn't renew automatically; switch to your own tunnel in porchlight's Tunnel tab."
-            ),
-        })
-        .collect()
+    if days >= 7 {
+        return Vec::new();
+    }
+
+    vec![TunnelWarning {
+        id: "certificate-close".to_owned(),
+        message: format!("Check OpenTunnel's certificate: it expires in {} days.", days.max(0)),
+    }]
+}
+#[cfg(test)]
+mod tests {
+    use super::route_matches;
+
+    #[test]
+    fn route_check_requires_the_exact_local_target_on_the_porchlight_route_line() {
+        assert!(route_matches(
+            "porchlight.home.opentunnel.xyz -> 127.0.0.1:18080\nother.example -> 127.0.0.1:18081",
+            "127.0.0.1:18080",
+        ));
+        assert!(!route_matches("porchlight.home.opentunnel.xyz -> 127.0.0.1:180800", "127.0.0.1:18080"));
+        assert!(!route_matches("not-porchlight.home -> 127.0.0.1:18080", "127.0.0.1:18080"));
+        assert!(!route_matches("porchlight.home -> 127.0.0.1:18081", "127.0.0.1:18080"));
+    }
 }

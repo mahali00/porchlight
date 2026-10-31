@@ -1,29 +1,32 @@
 use crate::client_metadata::ClientIdentity;
+use crate::core::now_ms;
+use crate::crypto::script_hash;
+use crate::policy::Level;
 use crate::rpc::with_status;
 use axum::body::Body;
 use axum::response::Response;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use http::{HeaderValue, StatusCode, header};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
-use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
 
 const STYLE: &str = include_str!("../assets/style.css");
+const SCRIPT: &str = include_str!("../assets/code.js");
 
-const GLOW: &str = "addEventListener('pointermove',e=>{const s=document.documentElement.style;s.setProperty('--x',e.clientX+'px');s.setProperty('--y',e.clientY+'px')},{passive:true})";
-
-static POLICY: LazyLock<String> = LazyLock::new(|| {
-    let hash = STANDARD.encode(Sha256::digest(GLOW.as_bytes()));
-    format!("default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{hash}'; frame-ancestors 'none'")
+static POLICY: LazyLock<Option<HeaderValue>> = LazyLock::new(|| {
+    HeaderValue::from_str(&format!(
+        "default-src 'none'; style-src 'unsafe-inline'; script-src {}; frame-ancestors 'none'",
+        script_hash(SCRIPT)
+    ))
+    .ok()
 });
 
 fn secured(mut response: Response) -> Response {
     let headers = response.headers_mut();
 
-    if let Ok(policy) = HeaderValue::from_str(&POLICY) {
-        headers.insert("content-security-policy", policy);
-    }
+    headers.insert(
+        "content-security-policy",
+        POLICY.clone().unwrap_or_else(|| HeaderValue::from_static("default-src 'none'")),
+    );
 
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
@@ -67,224 +70,349 @@ pub fn redirect_to(target: &str, params: &[(&str, &str)]) -> Response {
     secured(response)
 }
 
-fn document(title: &str, place: &str, main: &Markup) -> Markup {
+fn document(title: &str, place: &str, refresh: Option<u8>, main: &Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
-            meta charset="utf-8";
-            meta name="viewport" content="width=device-width,initial-scale=1";
-            title { (title) " · porchlight" }
-            style { (PreEscaped(STYLE)) }
-            script { (PreEscaped(GLOW)) }
-            header {
-                span class="mark" { "porchlight" }
-                small { (place) }
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover";
+                meta name="color-scheme" content="dark";
+                @if let Some(seconds) = refresh { meta http-equiv="refresh" content=(seconds); }
+                title { (title) " · porchlight" }
+                style { (PreEscaped(STYLE)) }
             }
-            (main)
+            body {
+                header {
+                    span class="mark" { svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true" {
+                        path d="M5 4h10M7 4v2h6V4" {}
+                        rect x="6" y="6" width="8" height="9" rx="2.5" {}
+                        circle cx="10" cy="10.5" r="1.6" {}
+                        path d="M8.5 15v2h3v-2" {}
+                    } "porchlight" }
+                    @if !place.is_empty() { span class="place" { (place) } }
+                }
+                (main)
+            }
         }
     }
 }
 
 pub struct Message {
-    pub label: &'static str,
     pub title: &'static str,
     pub detail: &'static str,
     pub next: &'static str,
 }
 
 pub fn message_response(status: StatusCode, message: &Message) -> Response {
-    let waiting = matches!(status.as_u16(), 400 | 429);
     let main = html! {
         main {
-            hgroup {
-                p class=(if waiting { "status label wait" } else { "status label" }) {
-                    (status.as_u16()) " · " (message.label)
-                }
-                h1 { (message.title) }
-            }
-            p class="detail" { (message.detail) }
-            p class="next" { span class="label" { "next" } (message.next) }
+            h1 { (message.title) }
+            p { (message.detail) }
+            p class="trust" { (message.next) }
         }
     };
 
-    html_response(&document(message.title, "", &main), status)
+    html_response(&document(message.title, "", None, &main), status)
+}
+
+pub struct SharedTool {
+    pub name: String,
+    pub level: Level,
 }
 
 pub struct RequestSummary {
     pub client: ClientIdentity,
     pub server_name: String,
-    pub tool_count: Option<usize>,
+    pub computer: String,
+    pub tools: Vec<SharedTool>,
+    pub opened_at: i64,
+    pub expires_at: i64,
     pub redirect_uri: String,
 }
 
-fn return_host(summary: &RequestSummary) -> String {
-    url::Url::parse(&summary.redirect_uri).ok().and_then(|url| url.host_str().map(str::to_owned)).unwrap_or_default()
+pub enum Entry {
+    Fresh,
+    Wrong { tries_left: i64 },
+    OtherBrowser,
 }
 
-fn returns_to(summary: &RequestSummary, verb: &str) -> String {
-    let host = return_host(summary);
+fn elsewhere(summary: &RequestSummary) -> Option<String> {
+    let redirect = url::Url::parse(&summary.redirect_uri).ok()?;
+    let loopback = redirect.host().is_some_and(|host| match host {
+        url::Host::Domain(host) => host == "localhost",
+        url::Host::Ipv4(host) => host.is_loopback(),
+        url::Host::Ipv6(host) => host.is_loopback(),
+    });
 
-    if matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]") {
-        format!("{verb} returns to an app on the device that started this. only continue if that was you")
-    } else {
-        format!("{verb} returns you to {host}")
+    if loopback { None } else { redirect.host_str().map(str::to_owned) }
+}
+
+fn client_title(client: &ClientIdentity) -> String {
+    match client.verified_host {
+        Some(_) => client.name.clone(),
+        None => format!("“{}”", client.name),
     }
 }
 
-struct Connection {
-    path: Markup,
-    ledger: Markup,
-    warning: Markup,
-    client_title: String,
-}
-
-fn connection(summary: &RequestSummary) -> Connection {
-    let client = &summary.client;
-    let verified = client.verified_host.is_some();
-    let starting = summary.tool_count.is_none();
-    let tools = summary
-        .tool_count
-        .map_or_else(|| " · still starting, tools appear once it's up".to_owned(), |count| format!(" · {count} tools"));
-    let badge = if let Some(host) = &client.verified_host {
-        html! { span class="badge verified" { "✓ verified · " (host) } }
-    } else {
-        html! { span class="badge unverified" { "name not verified" } }
-    };
-
-    Connection {
-        path: html! {
-            nav class="path" {
-                span class=(if verified { "" } else { "unverified" }) { i {} (client.name) }
-                div class="wire" {}
-                b {}
-                div class="wire" {}
-                span { i class=(if starting { "starting" } else { "live" }) {} (summary.server_name) }
-            }
-        },
-        ledger: html! {
-            dl {
-                div { dt { "asked by" } dd { (client.name) " " (badge) } }
-                div { dt { "wants" } dd { (summary.server_name) (tools) } }
-            }
-        },
-        warning: if verified {
-            html! {}
-        } else {
-            html! {
-                p class="warning" {
-                    strong { "this app's name isn't verified" }
-                    "anyone can call their app “" (client.name) "”. only continue if you just added this connector yourself and expect to return to " (return_host(summary)) "."
-                }
-            }
-        },
-        client_title: if verified { client.name.clone() } else { format!("“{}”", client.name) },
+fn identity(client: &ClientIdentity) -> Markup {
+    if let Some(host) = &client.verified_host {
+        return html! { p class="verified" { "Verified by " (host) } };
     }
-}
 
-pub fn authorize_page(request_id: &str, summary: &RequestSummary, approval_port: u16) -> Markup {
-    let shared = connection(summary);
-    let main = html! {
-        main class="connect" {
-            (shared.path)
-            hgroup {
-                p class="label" { "step 1 of 2 · connect" }
-                h1 { "connect " (shared.client_title) " to " (summary.server_name) }
-            }
-            (shared.ledger)
-            (shared.warning)
-            form class="approve" action=(format!("http://127.0.0.1:{approval_port}/approve")) {
-                input type="hidden" name="req" value=(request_id);
-                button class="primary wide" { "approve on this computer " span { "→" } }
-                p class="note" { (returns_to(summary, "approving")) "." }
-            }
-            details {
-                summary { "on a phone or another computer? " span { "use a code instead" } }
-                ol {
-                    li { "on the computer running porchlight, open porchlight" }
-                    li { "open the " code { "clients" } " tab and press " code { "c" } " on this request" }
-                    li { "enter the code it shows" }
-                }
-                form class="entry" method="post" action="/oauth/complete-code" {
-                    input type="hidden" name="req" value=(request_id);
-                    input id="code" name="code" placeholder="XXXX-XXXX" maxlength="9" autocomplete="one-time-code"
-                        autocapitalize="characters" spellcheck="false" aria-label="Code" required;
-                    button class="primary" { "connect " span { "→" } }
-                }
-            }
+    html! {
+        p class="warning" {
+            strong { "This app's name isn't verified." }
+            span { "Any app can call itself " (client.name) ". Go ahead only if you just connected it yourself." }
         }
-    };
-
-    document("Connect", "connection request", &main)
+    }
 }
 
-pub struct SharedTool {
-    pub name: String,
-    pub dangerous: bool,
+fn time_left(expires_at: i64) -> String {
+    let minutes = (expires_at - now_ms()).max(0) / 60_000;
+
+    match minutes {
+        0 => "in less than a minute".to_owned(),
+        1 => "in 1 minute".to_owned(),
+        minutes => format!("in {minutes} minutes"),
+    }
 }
 
-pub fn approval_page(
-    request_id: &str,
-    summary: &RequestSummary,
-    tools: &[SharedTool],
-    hostname: &str,
-    approval_port: u16,
-    csrf: &str,
-) -> Markup {
-    let shared = connection(summary);
+fn expiry(summary: &RequestSummary, label: &str) -> Markup {
+    let expires_at = summary.expires_at;
+    let lifetime = (expires_at - summary.opened_at).max(1);
+    let left = (expires_at - now_ms()).clamp(0, lifetime);
+    let permille = left * 1000 / lifetime;
+    let style = format!("--left:{}.{:03};--seconds:{}s", permille / 1000, permille % 1000, left / 1000);
+
+    html! {
+        div class=(if left < 2 * 60_000 { "expiry low" } else { "expiry" }) {
+            div class="track" { span style=(style) {} }
+            span { (label) " " (time_left(expires_at)) }
+        }
+    }
+}
+
+fn plural(count: i64, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+fn access(tools: &[SharedTool], open: bool) -> Markup {
     let mut sorted: Vec<&SharedTool> = tools.iter().collect();
-    sorted.sort_by_key(|tool| !tool.dangerous);
-    let main = html! {
-        main {
-            (shared.path)
-            hgroup {
-                p class="label" { "step 2 of 2 · approve" }
-                h1 { "allow " (shared.client_title) " to use " (summary.server_name) "?" }
-            }
-            (shared.ledger)
-            (shared.warning)
+    sorted.sort_by_key(|tool| std::cmp::Reverse(tool.level));
+    let count = |wanted: fn(Level) -> bool| {
+        i64::try_from(sorted.iter().filter(|tool| wanted(tool.level)).count()).unwrap_or(i64::MAX)
+    };
+    let changes = count(|level| matches!(level, Level::Changes | Level::ClientChooses));
+    let runs = count(|level| level == Level::RunsCode);
+    let mut summary = vec![plural(count(|_| true), "tool", "tools")];
+    if changes > 0 {
+        summary.push(format!("{changes} can change things"));
+    }
+    if runs > 0 {
+        summary.push(plural(runs, "runs commands", "run commands"));
+    }
+    let summary = summary.join(" · ");
+
+    html! {
+        details open[open] {
+            summary { "What it can use" small { (summary) } }
             @if !sorted.is_empty() {
-                details class="tools" open {
-                    summary { "tools it can use" }
-                    ul {
-                        @for tool in &sorted {
-                            @if tool.dangerous {
-                                li class="danger" { code { (tool.name) } " can run commands or code" }
-                            } @else {
-                                li { code { (tool.name) } }
+                ul class="tools" {
+                    @for tool in &sorted {
+                        li {
+                            code { (tool.name) }
+                            @match tool.level {
+                                Level::RunsCode => span class="badge" { "runs commands" },
+                                Level::Changes | Level::ClientChooses => span class="badge" { "can change things" },
+                                Level::Reads => {},
                             }
                         }
                     }
                 }
             }
-            form method="post" action=(format!("http://127.0.0.1:{approval_port}/approve")) {
-                input type="hidden" name="req" value=(request_id);
-                input type="hidden" name="csrf" value=(csrf);
-                div class="buttons" {
-                    button class="primary" name="decision" value="allow" { "allow " span { "→" } }
-                    button name="decision" value="deny" { "deny" }
+        }
+    }
+}
+
+pub fn authorize_page(request_id: &str, summary: &RequestSummary, entry: &Entry) -> Markup {
+    let client = &summary.client;
+    let main = html! {
+        main class="connect" {
+            (seal("lock"))
+            div class="lede" {
+                @if let Entry::OtherBrowser = entry {
+                    h1 { "Go back to the browser " (client.name) " opened" }
+                } @else {
+                    h1 { "Enter the code from " (summary.computer) }
                 }
-                p class="note" { (returns_to(summary, "allowing")) ". undo it anytime in porchlight's clients tab." }
+                p { "This connects " strong { (client_title(client)) } " to " strong { (summary.server_name) } "." }
             }
-            p class="local" { "this page only opens on this computer. the tunnel can't reach it, so nobody else can press allow." }
+            @match &client.verified_host {
+                Some(host) => p class="verified" { "Verified by " (host) },
+                None => p class="warning" {
+                    strong { "Only continue if you started this." }
+                    span {
+                        "Any app can call itself " (client.name) "."
+                        @if let Some(host) = elsewhere(summary) { " After you connect, it sends you to " b { (host) } "." }
+                    }
+                },
+            }
+            @if let Entry::OtherBrowser = entry {
+                p class="error" role="alert" {
+                    "This page only works in the browser " (client.name) " opened. "
+                    "Enter the code there. Nothing was used up here."
+                }
+            } @else {
+                form class=(if matches!(entry, Entry::Wrong { .. }) { "entry wrong" } else { "entry" })
+                    method="post" action="/oauth/complete-code" {
+                    input type="hidden" name="req" value=(request_id);
+                    label for="code" { "Code" }
+                    div class="pin" {
+                        div class="slots" aria-hidden="true" { @for _ in 0..8 { span {} } }
+                        input id="code" name="code" value="" maxlength="9"
+                            aria-describedby="code-feedback" aria-invalid=(if matches!(entry, Entry::Wrong { .. }) { "true" } else { "false" })
+                            autocomplete="one-time-code" autocapitalize="characters" autocorrect="off" spellcheck="false"
+                            enterkeyhint="go" required autofocus;
+                    }
+                    p id="code-feedback" class=(if matches!(entry, Entry::Wrong { .. }) { "feedback error" } else { "feedback hint" }) role="status" {
+                        @if let Entry::Wrong { tries_left } = entry {
+                            "That code didn't match. " (plural(*tries_left, "try", "tries")) " left."
+                        } @else {
+                            "Lowercase and dashes are fine."
+                        }
+                    }
+                    button class="primary" type="submit" { "Connect" }
+                }
+                p class="hint" {
+                    "It's in porchlight on " (summary.computer) ": the notification, Clients, or "
+                    code { "porchlight approve" } ". Expires " (time_left(summary.expires_at)) "."
+                }
+            }
+            div class="group" { (access(&summary.tools, false)) }
+            script { (PreEscaped(SCRIPT)) }
         }
     };
 
-    document("Approve", &format!("porchlight on {hostname}"), &main)
+    document("Connect", "", None, &main)
+}
+
+fn seal(kind: &str) -> Markup {
+    html! {
+        div class=(format!("seal {kind}")) aria-hidden="true" {
+            svg viewBox="0 0 32 32" {
+                @match kind {
+                    "ok" => { path d="M8 16.5l5.5 5.5L24 11" {} }
+                    "lock" => { rect x="8" y="14" width="16" height="12" rx="2" {} path d="M11 14V9a5 5 0 0 1 10 0v5" {} }
+                    "denied" => { path d="M10.5 10.5l11 11M21.5 10.5l-11 11" {} }
+                    _ => { circle cx="16" cy="16" r="10" {} path d="M16 10.5V16l3.5 2.5" {} }
+                }
+            }
+        }
+    }
+}
+
+pub fn ended_page(client: &str) -> Response {
+    let main = html! {
+        main class="done" {
+            (seal("ended"))
+            h1 { "This request has ended" }
+            p { "It was turned down on the computer, or the code expired or was entered wrong too many times." }
+            p class="trust" { "Start again from " (client) ". It will ask for a new code." }
+        }
+    };
+
+    html_response(&document("Request ended", "", None, &main), StatusCode::GONE)
+}
+
+pub fn code_page(request_id: &str, summary: &RequestSummary, code: &str, wrong: i64, csrf: &str) -> Markup {
+    let main = html! {
+        main class="code-view" {
+            div class="request-intro" {
+                p class="eyebrow" { "Connection request" }
+                h1 { (client_title(&summary.client)) " wants to connect to " (summary.server_name) }
+                p { "Type this code on the device that is connecting. Only do it if you started this connection yourself." }
+                div class="code-card" {
+                    p class="label" { "Type this code on the device that's connecting" }
+                    p class="code" aria-label=(code) {
+                        @for letter in code.chars() {
+                            @if letter == '-' { span class="dash" { "-" } } @else { span { (letter) } }
+                        }
+                    }
+                    (expiry(summary, "Expires"))
+                }
+                @if wrong > 0 {
+                    p class="error" role="status" {
+                        "A wrong code was entered " (plural(wrong, "time", "times")) ". "
+                        "If that wasn't you, deny this request."
+                    }
+                } @else {
+                    p class="status" { span class="pulse" {} "Waiting for the code. Share it only with the device you're setting up." }
+                }
+                form method="post" action="/deny" {
+                    input type="hidden" name="req" value=(request_id);
+                    input type="hidden" name="csrf" value=(csrf);
+                    button class="quiet" { "Deny this request" }
+                }
+            }
+            div class="request-card" {
+                div class="request-section" {
+                    h2 { "Requested by" }
+                    strong { (client_title(&summary.client)) }
+                    (identity(&summary.client))
+                }
+                div class="request-section" {
+                    h2 { "Link" }
+                    strong { (summary.server_name) }
+                }
+                div class="request-section" {
+                    (access(&summary.tools, true))
+                }
+            }
+        }
+    };
+
+    document("Code", "this computer", Some(3), &main)
+}
+
+pub enum Outcome {
+    Connected,
+    Denied,
+    Ended,
+}
+
+pub fn outcome_page(client: &str, server: &str, outcome: &Outcome) -> Markup {
+    let main = html! {
+        main class="done" {
+            @match outcome {
+                Outcome::Connected => {
+                    (seal("ok"))
+                    h1 { (client) " is connected to " (server) }
+                    p { "You can close this page." }
+                    p class="trust" { "Take access away any time under Clients in porchlight." }
+                }
+                Outcome::Denied => {
+                    (seal("denied"))
+                    h1 { "Denied" }
+                    p { (client) " can't use " (server) ". Nothing was shared." }
+                }
+                Outcome::Ended => {
+                    (seal("ended"))
+                    h1 { "This request has ended" }
+                    p { "The code expired or was entered wrong too many times. Nothing was shared." }
+                    p class="trust" { "To connect, start again from " (client) "." }
+                }
+            }
+            a class="button" href="/" { "Back to porchlight" }
+        }
+    };
+
+    document("Request", "this computer", None, &main)
 }
 
 pub struct PanelLink {
     pub name: String,
     pub address: String,
-    pub state: &'static str,
-    pub tools: usize,
-    pub clients: usize,
-}
-
-pub struct PanelClient {
-    pub id: String,
-    pub name: String,
-    pub link: String,
-    pub last_used: String,
 }
 
 pub struct PanelRequest {
@@ -294,77 +422,36 @@ pub struct PanelRequest {
 }
 
 pub struct Panel {
-    pub host: String,
-    pub csrf: String,
     pub links: Vec<PanelLink>,
-    pub problems: Vec<String>,
     pub pending: Vec<PanelRequest>,
-    pub clients: Vec<PanelClient>,
-}
-
-fn plural(count: usize, word: &str) -> String {
-    if count == 1 { format!("1 {word}") } else { format!("{count} {word}s") }
 }
 
 pub fn control_page(panel: &Panel) -> Markup {
-    let headline = match panel.pending.len() {
-        0 if panel.links.is_empty() => "nothing shared yet".to_owned(),
-        0 => "the light is on".to_owned(),
-        count => format!("{} at the door", plural(count, "client")),
-    };
     let main = html! {
         main class="home" {
-            hgroup {
-                p class="label" { "on " (panel.host) }
-                h1 { (headline) }
-            }
-            @if !panel.pending.is_empty() {
-                ul class="rows waiting" {
+            h1 { "Waiting for approval" }
+            @if panel.pending.is_empty() {
+                p class="empty" { span class="lamp" {} "Nothing is waiting. When an app connects, its code shows up here." }
+            } @else {
+                ul class="rows waiting group" {
                     @for request in &panel.pending {
                         li {
-                            span { strong { (request.client) } " " small { "wants " (request.link) } }
-                            a class="primary" href=(format!("/approve?req={}", url::form_urlencoded::byte_serialize(request.id.as_bytes()).collect::<String>())) { "review →" }
+                            span class="who" { strong { (request.client) } small { "wants " (request.link) } }
+                            a class="button primary compact" href=(format!("/approve?req={}", url::form_urlencoded::byte_serialize(request.id.as_bytes()).collect::<String>())) { "Show code" }
                         }
                     }
                 }
             }
             section {
-                h2 { "links" }
-                ul class="rows" {
-                    @for problem in &panel.problems {
-                        li class="bad" { "✗ " (problem) }
-                    }
-                    @if panel.links.is_empty() {
-                        li { small { "run porchlight to share an app" } }
-                    }
+                h2 { "Links" }
+                ul class="rows group" {
                     @for link in &panel.links {
-                        li {
-                            span { i class=(link.state) {} strong { (link.name) } " " small { (plural(link.tools, "tool")) " · " (plural(link.clients, "client")) } }
-                            code { (link.address) }
-                        }
+                        li { strong { (link.name) } code { (link.address) } }
                     }
                 }
             }
-            @if !panel.clients.is_empty() {
-                section {
-                    h2 { "clients" }
-                    ul class="rows" {
-                        @for client in &panel.clients {
-                            li {
-                                span { (client.name) " " small { (client.link) " · " (client.last_used) } }
-                                form method="post" action="/revoke" {
-                                    input type="hidden" name="csrf" value=(panel.csrf);
-                                    input type="hidden" name="id" value=(client.id);
-                                    button { "revoke" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            p class="local" { "tools, logs and the tunnel live in the porchlight app. this page only opens on this computer." }
         }
     };
 
-    document("home", "", &main)
+    document("Home", "this computer", Some(5), &main)
 }

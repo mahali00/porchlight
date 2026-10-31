@@ -3,10 +3,12 @@ use crate::policy::is_rule_pattern;
 use indexmap::{IndexMap, IndexSet};
 use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -17,23 +19,6 @@ pub struct ConfigError {
 
 fn error(message: impl Into<String>) -> ConfigError {
     ConfigError { message: message.into() }
-}
-
-pub fn state_dir() -> PathBuf {
-    std::env::var_os("PORCHLIGHT_HOME")
-        .map_or_else(|| std::env::home_dir().unwrap_or_default().join(".porchlight"), PathBuf::from)
-}
-
-pub fn in_state_dir(name: &str) -> PathBuf {
-    state_dir().join(name)
-}
-
-pub fn log_dir() -> PathBuf {
-    in_state_dir("logs")
-}
-
-pub fn config_path() -> PathBuf {
-    in_state_dir("porchlight.json")
 }
 
 const SCHEMA_URL: &str = "https://raw.githubusercontent.com/mahali00/porchlight/main/porchlight.schema.json";
@@ -88,6 +73,10 @@ pub struct Input {
 impl Input {
     pub fn is_optional(&self) -> bool {
         self.optional == Some(true)
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.choices.is_none() && self.flag.is_none() && matches!(self.kind, None | Some(InputType::String))
     }
 }
 
@@ -444,7 +433,7 @@ fn decode_each<T>(
 
 pub fn load_text(text: &str) -> Result<(Loaded, bool), ConfigError> {
     if text.trim().is_empty() {
-        return Ok((Loaded::default(), false));
+        return Err(error("porchlight.json is empty"));
     }
 
     let parsed = parse(text)?;
@@ -511,10 +500,21 @@ fn write(path: &Path, text: &str) -> Result<(), ConfigError> {
     let failed = |cause: std::io::Error| error(format!("Couldn't write {}: {cause}", path.display()));
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(failed)?;
-    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    fs::write(&temporary, text).map_err(failed)?;
-    secure(&temporary)?;
-    fs::rename(&temporary, path).map_err(failed)
+    let (temporary, mut file) = (0_u32..)
+        .find_map(|counter| {
+            let temporary = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), counter));
+            match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary) {
+                Ok(file) => Some(Ok((temporary, file))),
+                Err(cause) if cause.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(cause) => Some(Err(failed(cause))),
+            }
+        })
+        .ok_or_else(|| error(format!("Couldn't create a temporary file for {}", path.display())))??;
+    file.write_all(text.as_bytes()).map_err(failed)?;
+    file.sync_all().map_err(failed)?;
+    drop(file);
+    fs::rename(&temporary, path).map_err(failed)?;
+    OpenOptions::new().read(true).open(dir).and_then(|directory| directory.sync_all()).map_err(failed)
 }
 
 #[derive(Clone, Debug)]
@@ -528,20 +528,35 @@ impl Config {
     }
 
     pub fn default_location() -> Self {
-        Self::at(config_path())
+        Self::at(crate::core::config_path())
     }
 
     pub fn load(&self) -> Result<Loaded, ConfigError> {
-        let (loaded, exists) = load_text(&read_text(&self.path)?)?;
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => {
+                secure(&self.path)?;
+                text
+            }
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::default()),
+            Err(cause) => return Err(error(format!("Couldn't read {}: {cause}", self.path.display()))),
+        };
 
-        if exists {
-            secure(&self.path)?;
-        }
-
-        Ok(loaded)
+        load_text(&text).map(|(loaded, _)| loaded)
     }
 
     pub fn edit(&self, at: &[&str], value: Option<&Value>) -> Result<(), ConfigError> {
+        let failed = |cause: std::io::Error| error(format!("Couldn't lock {}: {cause}", self.path.display()));
+        let lock_path = self.path.with_extension("json.lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(lock_path)
+            .map_err(failed)?;
+        let _lock = Flock::lock(lock_file, FlockArg::LockExclusive)
+            .map_err(|(_, cause)| failed(std::io::Error::from(cause)))?;
         let current = read_text(&self.path)?;
         let text =
             if current.trim().is_empty() { format!("{{\n  \"$schema\": \"{SCHEMA_URL}\"\n}}\n") } else { current };

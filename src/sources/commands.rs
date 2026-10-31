@@ -1,35 +1,29 @@
 use super::process::process_environment;
 use super::{Notices, SourceRequest};
-use crate::config::{Input, InputType};
+use crate::config::Input;
 use crate::core::{Annotations, Tool, ToolResult};
+use crate::policy::Risk;
 use crate::rpc::{self, decode_batch, empty, list_notification_stream, parse_error, rpc_error, rpc_result};
 use axum::response::Response;
 use futures::future::join_all;
 use http::{HeaderValue, Method, StatusCode, header};
 use indexmap::IndexMap;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
-use std::path::Path;
+use serde_json::{Value, json};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+mod inputs;
+mod risk;
+mod template;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Part {
-    Text(String),
-    Input(String),
-}
-
-pub type Word = Vec<Part>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LookupKind {
-    Env,
-    File,
-}
-
-pub type Lookup<'a> = &'a dyn Fn(LookupKind, &str) -> Option<String>;
+use inputs::input_schema;
+pub use inputs::validate;
+pub use risk::{assess, runs_client_code};
+pub use template::{Lookup, LookupKind, Part, Word, fill, inputs_of, literal, parse_word, sole_input};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommandTool {
@@ -47,335 +41,10 @@ const TIMEOUT: Duration = Duration::from_mins(1);
 
 const MAX_OUTPUT: usize = 100_000;
 
-const MAX_INPUT: usize = 4_096;
-
-fn push_text(word: &mut Word, text: &str) {
-    if text.is_empty() {
-        return;
+impl CommandTool {
+    pub fn risk(&self) -> Risk {
+        assess(&self.words, &self.inputs, self.read_only)
     }
-
-    if let Some(Part::Text(last)) = word.last_mut() {
-        last.push_str(text);
-    } else {
-        word.push(Part::Text(text.to_owned()));
-    }
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-enum Reference<'a> {
-    Lookup(LookupKind, &'a str),
-    Input(&'a str),
-}
-
-fn reference(inner: &str) -> Option<Reference<'_>> {
-    if let Some(name) = inner.strip_prefix("env:").filter(|name| !name.is_empty()) {
-        return Some(Reference::Lookup(LookupKind::Env, name));
-    }
-
-    if let Some(name) = inner.strip_prefix("file:").filter(|name| !name.is_empty()) {
-        return Some(Reference::Lookup(LookupKind::File, name));
-    }
-
-    (!inner.is_empty() && inner.chars().all(is_word_char)).then_some(Reference::Input(inner))
-}
-
-pub fn parse_word(word: &str, lookup: Lookup) -> Result<Word, String> {
-    let mut parts = Word::new();
-    let mut rest = word;
-
-    while let Some(open) = rest.find('{') {
-        let (before, from_brace) = rest.split_at(open);
-        push_text(&mut parts, before);
-        let after_brace = from_brace.get(1..).unwrap_or_default();
-        let found = after_brace.find('}').and_then(|close| {
-            let inner = after_brace.get(..close)?;
-            Some((reference(inner)?, after_brace.get(close + 1..).unwrap_or_default()))
-        });
-
-        match found {
-            Some((Reference::Input(name), tail)) => {
-                parts.push(Part::Input(name.to_owned()));
-                rest = tail;
-            }
-            Some((Reference::Lookup(kind, name), tail)) => {
-                let value = lookup(kind, name).ok_or_else(|| match kind {
-                    LookupKind::Env => format!("{name} isn't set"),
-                    LookupKind::File => format!("can't read {name}"),
-                })?;
-                push_text(&mut parts, &value);
-                rest = tail;
-            }
-            None => {
-                push_text(&mut parts, "{");
-                rest = after_brace;
-            }
-        }
-    }
-
-    push_text(&mut parts, rest);
-
-    Ok(parts)
-}
-
-pub fn literal(word: &Word) -> String {
-    word.iter()
-        .map(|part| match part {
-            Part::Text(text) => text.clone(),
-            Part::Input(name) => format!("{{{name}}}"),
-        })
-        .collect()
-}
-
-pub fn inputs_of(words: &[Word]) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-
-    for part in words.iter().flatten() {
-        if let Part::Input(name) = part
-            && !names.contains(name)
-        {
-            names.push(name.clone());
-        }
-    }
-
-    names
-}
-
-pub fn sole_input(word: &Word) -> Option<&str> {
-    match word.as_slice() {
-        [Part::Input(name)] => Some(name),
-        _ => None,
-    }
-}
-
-fn has_input(word: &Word) -> bool {
-    word.iter().any(|part| matches!(part, Part::Input(_)))
-}
-
-fn runs_anything(name: &str) -> bool {
-    const SHELLS: [&str; 8] = ["sh", "bash", "zsh", "fish", "csh", "ksh", "tcsh", "dash"];
-    const OTHERS: [&str; 20] = [
-        "node",
-        "bun",
-        "deno",
-        "ruby",
-        "perl",
-        "php",
-        "lua",
-        "awk",
-        "gawk",
-        "mawk",
-        "nawk",
-        "osascript",
-        "pwsh",
-        "powershell",
-        "env",
-        "xargs",
-        "sudo",
-        "ssh",
-        "eval",
-        "python",
-    ];
-
-    SHELLS.contains(&name)
-        || OTHERS.contains(&name)
-        || name.strip_prefix("python").is_some_and(|version| version.chars().all(|c| c.is_ascii_digit() || c == '.'))
-}
-
-pub fn runs_client_code(words: &[Word]) -> bool {
-    let Some(program) = words.first() else {
-        return false;
-    };
-
-    if has_input(program) {
-        return true;
-    }
-
-    let text: String = program
-        .iter()
-        .filter_map(|part| if let Part::Text(text) = part { Some(text.as_str()) } else { None })
-        .collect();
-    let name = Path::new(&text).file_name().and_then(|name| name.to_str()).unwrap_or_default();
-
-    runs_anything(name) && words.iter().any(has_input)
-}
-
-fn number_text(number: &serde_json::Number) -> String {
-    match number.as_f64() {
-        Some(float) if !number.is_i64() && !number.is_u64() && float.fract() == 0.0 && float.abs() < 1e21 => {
-            format!("{float:.0}")
-        }
-        _ => number.to_string(),
-    }
-}
-
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Number(number) => number_text(number),
-        other => other.to_string(),
-    }
-}
-
-fn fill_word(word: &Word, values: &Map<String, Value>, inputs: &IndexMap<String, Input>) -> Option<String> {
-    if word.iter().any(|part| matches!(part, Part::Input(name) if !values.contains_key(name))) {
-        return None;
-    }
-
-    if let Some(name) = sole_input(word)
-        && let Some(flag) = inputs.get(name).and_then(|input| input.flag.as_ref())
-    {
-        return (values.get(name) == Some(&Value::Bool(true))).then(|| flag.clone());
-    }
-
-    Some(
-        word.iter()
-            .map(|part| match part {
-                Part::Text(text) => text.clone(),
-                Part::Input(name) => values.get(name).map(value_text).unwrap_or_default(),
-            })
-            .collect(),
-    )
-}
-
-pub fn fill(words: &[Word], values: &Map<String, Value>, inputs: &IndexMap<String, Input>) -> Vec<String> {
-    words.iter().filter_map(|word| fill_word(word, values, inputs)).collect()
-}
-
-fn starts_word(words: &[Word], name: &str) -> bool {
-    words.iter().any(|word| matches!(word.first(), Some(Part::Input(first)) if first == name))
-}
-
-fn check_number(name: &str, value: &Value, input: Option<&Input>, integer: bool, starts: bool) -> Result<(), String> {
-    let number = value.as_f64().filter(|number| number.is_finite()).ok_or(format!("{name}: must be a number"))?;
-
-    if integer && number.fract() != 0.0 {
-        return Err(format!("{name}: must be a whole number"));
-    }
-
-    if let Some(min) = input.and_then(|input| input.min).filter(|min| number < *min) {
-        return Err(format!("{name}: must be at least {min}"));
-    }
-
-    if let Some(max) = input.and_then(|input| input.max).filter(|max| number > *max) {
-        return Err(format!("{name}: must be at most {max}"));
-    }
-
-    if starts && number < 0.0 {
-        return Err(format!("{name}: can't be negative here"));
-    }
-
-    Ok(())
-}
-
-fn check_value(name: &str, value: &Value, input: Option<&Input>, starts: bool) -> Result<(), String> {
-    match input.and_then(|input| input.kind) {
-        Some(InputType::Boolean) => value.is_boolean().then_some(()).ok_or(format!("{name}: must be true or false")),
-        Some(InputType::Integer) => check_number(name, value, input, true, starts),
-        Some(InputType::Number) => check_number(name, value, input, false, starts),
-        Some(InputType::String) | None => {
-            let text = value.as_str().ok_or(format!("{name}: must be text"))?;
-
-            if let Some(choices) = input.and_then(|input| input.choices.as_ref()) {
-                return choices
-                    .iter()
-                    .any(|choice| choice == text)
-                    .then_some(())
-                    .ok_or(format!("{name}: must be one of {}", choices.join(", ")));
-            }
-
-            if text.chars().count() > MAX_INPUT {
-                return Err(format!("{name}: must be at most {MAX_INPUT} characters"));
-            }
-
-            if starts && (text.is_empty() || text.starts_with('-')) {
-                return Err(format!("{name}: can't be empty or start with \"-\""));
-            }
-
-            Ok(())
-        }
-    }
-}
-
-pub fn validate(tool: &CommandTool, arguments: &Value) -> Result<Map<String, Value>, String> {
-    let given = arguments.as_object().ok_or("arguments must be an object")?;
-    let mut values = Map::new();
-
-    for name in inputs_of(&tool.words) {
-        let input = tool.inputs.get(&name);
-
-        match given.get(&name) {
-            None if input.is_some_and(Input::is_optional) => {}
-            None => return Err(format!("{name}: is missing")),
-            Some(value) => {
-                check_value(&name, value, input, starts_word(&tool.words, &name))?;
-                values.insert(name, value.clone());
-            }
-        }
-    }
-
-    Ok(values)
-}
-
-fn property(input: Option<&Input>, starts: bool) -> Value {
-    let mut schema = Map::new();
-
-    match input.and_then(|input| input.kind) {
-        Some(InputType::Boolean) => {
-            schema.insert("type".into(), json!("boolean"));
-        }
-        Some(kind @ (InputType::Integer | InputType::Number)) => {
-            schema.insert("type".into(), json!(if kind == InputType::Integer { "integer" } else { "number" }));
-            let floor = if starts { Some(0.0) } else { None };
-            let minimum = [input.and_then(|input| input.min), floor].into_iter().flatten().reduce(f64::max);
-
-            if let Some(minimum) = minimum {
-                schema.insert("minimum".into(), json!(minimum));
-            }
-
-            if let Some(maximum) = input.and_then(|input| input.max) {
-                schema.insert("maximum".into(), json!(maximum));
-            }
-        }
-        Some(InputType::String) | None => {
-            schema.insert("type".into(), json!("string"));
-
-            if let Some(choices) = input.and_then(|input| input.choices.as_ref()) {
-                schema.insert("enum".into(), json!(choices));
-            } else {
-                schema.insert("maxLength".into(), json!(MAX_INPUT));
-
-                if starts {
-                    schema.insert("pattern".into(), json!("^[^-]"));
-                }
-            }
-        }
-    }
-
-    if let Some(description) = input.and_then(|input| input.description.as_ref()) {
-        schema.insert("description".into(), json!(description));
-    }
-
-    Value::Object(schema)
-}
-
-fn input_schema(tool: &CommandTool) -> Value {
-    let names = inputs_of(&tool.words);
-
-    if names.is_empty() {
-        return json!({ "type": "object", "properties": {} });
-    }
-
-    let properties: Map<String, Value> = names
-        .iter()
-        .map(|name| (name.clone(), property(tool.inputs.get(name), starts_word(&tool.words, name))))
-        .collect();
-    let required: Vec<&String> =
-        names.iter().filter(|name| !tool.inputs.get(*name).is_some_and(Input::is_optional)).collect();
-
-    json!({ "type": "object", "properties": properties, "required": required, "additionalProperties": false })
 }
 
 fn tool_for(name: &str, tool: &CommandTool) -> Tool {
@@ -383,8 +52,8 @@ fn tool_for(name: &str, tool: &CommandTool) -> Tool {
         name: name.to_owned(),
         description: Some(tool.description.clone().unwrap_or_else(|| format!("Runs {}", tool.template))),
         annotations: Some(Annotations {
-            read_only_hint: Some(tool.read_only),
-            destructive_hint: Some(!tool.read_only),
+            read_only_hint: Some(tool.risk().reads()),
+            destructive_hint: Some(!tool.risk().reads()),
         }),
         input_schema: Some(input_schema(tool)),
     }
@@ -428,7 +97,8 @@ async fn execute(argv: &[String], tool: &CommandTool) -> ToolResult {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .process_group(0);
 
     if let Some(cwd) = &tool.cwd {
         command.current_dir(cwd);
@@ -440,13 +110,19 @@ async fn execute(argv: &[String], tool: &CommandTool) -> ToolResult {
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return ToolResult { text: format!("Couldn't read the output of {program}"), is_error: true };
     };
+    let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
     let finished = async {
         let (stdout, stderr, status) = tokio::join!(collect(stdout), collect(stderr), child.wait());
         (stdout, stderr, status)
     };
 
     match tokio::time::timeout(TIMEOUT, finished).await {
-        Err(_) => ToolResult { text: "Stopped after 60 seconds".to_owned(), is_error: true },
+        Err(_) => {
+            if let Some(pid) = pid {
+                let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
+            }
+            ToolResult { text: "Stopped after 60 seconds".to_owned(), is_error: true }
+        }
         Ok((_, _, Err(_))) => ToolResult { text: format!("Couldn't read the output of {program}"), is_error: true },
         Ok((stdout, _, Ok(status))) if status.success() => {
             ToolResult { text: if stdout.is_empty() { "Done.".to_owned() } else { stdout }, is_error: false }
@@ -597,7 +273,10 @@ impl CommandSource {
 
         let mime = if structured(&run.text).is_some() { "application/json" } else { "text/plain" };
 
-        rpc_result(id, json!({ "contents": [{ "uri": resource.uri, "mimeType": mime, "text": run.text }] }))
+        rpc_result(
+            id,
+            json!({ "contents": [{ "uri": resource.uri, "mimeType": mime, "text": run.text }], "ttlMs": 0, "cacheScope": "private" }),
+        )
     }
 
     fn initialize(&self, request: &RpcRequest) -> Value {
@@ -612,7 +291,7 @@ impl CommandSource {
         let mut result = json!({
             "protocolVersion": version,
             "capabilities": {},
-            "serverInfo": { "name": self.name, "version": "1.0.0" },
+            "serverInfo": { "name": self.name, "version": crate::core::VERSION },
         });
 
         if !self.resources.is_empty()
@@ -637,8 +316,16 @@ impl CommandSource {
 
         match request.method.as_str() {
             "initialize" => self.initialize(request),
+            "server/discover" => rpc_result(
+                id,
+                json!({
+                    "protocolVersions": ["2025-06-18", "2025-11-25", "2026-07-28"],
+                    "capabilities": { "tools": {}, "resources": {} },
+                    "serverInfo": { "name": self.name, "version": crate::core::VERSION }
+                }),
+            ),
             "ping" => rpc_result(id, json!({})),
-            "tools/list" => rpc_result(id, json!({ "tools": self.listed })),
+            "tools/list" => rpc_result(id, json!({ "tools": self.listed, "ttlMs": 0, "cacheScope": "private" })),
             "tools/call" => self.call(request).await,
             "resources/list" => {
                 let resources: Vec<Value> = self
@@ -646,7 +333,7 @@ impl CommandSource {
                     .iter()
                     .map(|item| json!({ "uri": item.uri, "name": item.name, "description": item.description }))
                     .collect();
-                rpc_result(id, json!({ "resources": resources }))
+                rpc_result(id, json!({ "resources": resources, "ttlMs": 0, "cacheScope": "private" }))
             }
             "resources/read" => self.read(request).await,
             method => rpc_error(id, -32601, &format!("Method not found: {method}")),
@@ -678,5 +365,33 @@ impl CommandSource {
             (true, _) => rpc::json(&Value::Array(replies), StatusCode::OK),
             (false, _) => rpc::json(&replies.swap_remove(0), StatusCode::OK),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(words: &[&str]) -> Vec<Word> {
+        words
+            .iter()
+            .map(|word| {
+                if word.starts_with('{') && word.ends_with('}') {
+                    vec![Part::Input(word.trim_matches(['{', '}']).to_owned())]
+                } else {
+                    vec![Part::Text((*word).to_owned())]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn classifies_dispatchers_and_interpreter_flags_with_client_input_as_code() {
+        assert!(runs_client_code(&words(&["busybox", "sh", "-c", "{script}"])));
+        assert!(runs_client_code(&words(&["toybox", "awk", "{code}"])));
+        assert!(runs_client_code(&words(&["python3", "-c", "{script}"])));
+        assert!(runs_client_code(&words(&["env", "python", "-e", "{script}"])));
+        assert!(!runs_client_code(&words(&["echo", "{text}"])));
+        assert!(!runs_client_code(&words(&["python", "-c", "trusted literal"])));
     }
 }

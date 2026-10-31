@@ -1,7 +1,8 @@
+use super::SourceRequest;
 use super::process::{ProcessSpec, RunningProcess};
-use super::{SourceRequest, UpstreamError};
 use crate::core::{Tool, now_ms};
 use crate::crypto::random_token;
+use crate::rpc::UpstreamError;
 use crate::rpc::{self, decode_batch, decode_tools_list, empty, event_stream, id_key, parse_error, rpc_error};
 use crate::store::{StdioSession, Store};
 use axum::body::Body;
@@ -14,7 +15,7 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
@@ -25,6 +26,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
 const START_TIMEOUT: Duration = Duration::from_mins(1);
 
 const IDLE_TIMEOUT_MS: i64 = 30 * 60_000;
+const MAX_SESSIONS: usize = 8;
 
 pub struct StdioSpec {
     pub name: String,
@@ -82,13 +84,14 @@ impl Session {
 }
 
 fn porchlight_initialize() -> Value {
-    json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "porchlight", "version": "0.1.0" } })
+    json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "porchlight", "version": crate::core::VERSION } })
 }
 
 pub struct StdioSource {
     spec: StdioSpec,
     store: Store,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    sessions_live: AtomicUsize,
     resuming: tokio::sync::Mutex<()>,
     me: Weak<StdioSource>,
     sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -100,6 +103,7 @@ impl StdioSource {
             spec,
             store,
             sessions: Mutex::new(HashMap::new()),
+            sessions_live: AtomicUsize::new(0),
             resuming: tokio::sync::Mutex::new(()),
             me: me.clone(),
             sweeper: Mutex::new(None),
@@ -145,11 +149,56 @@ impl StdioSource {
         session.process.terminate().await;
 
         if removed.is_some() {
+            self.sessions_live.fetch_sub(1, Ordering::AcqRel);
             self.remember(session);
         }
     }
 
-    fn open(&self, id: Option<String>) -> Result<Arc<Session>, UpstreamError> {
+    fn reserve(&self) -> bool {
+        self.sessions_live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < MAX_SESSIONS).then_some(count + 1))
+            .is_ok()
+    }
+
+    async fn evict_idlest(&self) -> bool {
+        let idlest = self
+            .all()
+            .into_iter()
+            .filter(|session| session.pending.lock().is_ok_and(|pending| pending.is_empty()))
+            .min_by_key(|session| session.last_used());
+
+        match idlest {
+            Some(session) => {
+                self.close(&session).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    async fn open(&self, id: Option<String>) -> Result<Arc<Session>, UpstreamError> {
+        while !self.reserve() {
+            if !self.evict_idlest().await {
+                return Err(UpstreamError::new(format!("{} has reached its session limit", self.spec.name)));
+            }
+        }
+
+        let session = match self.spawn(id) {
+            Ok(session) => session,
+            Err(error) => {
+                self.sessions_live.fetch_sub(1, Ordering::AcqRel);
+                return Err(error);
+            }
+        };
+
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.insert(session.id.clone(), session.clone());
+        }
+
+        Ok(session)
+    }
+
+    fn spawn(&self, id: Option<String>) -> Result<Arc<Session>, UpstreamError> {
         let id = id.unwrap_or_else(|| random_token(16));
         let (process, mut lines) = RunningProcess::start(&ProcessSpec {
             command: self.spec.command.clone(),
@@ -159,16 +208,12 @@ impl StdioSource {
         })?;
         let (events, _) = broadcast::channel(256);
         let session = Arc::new(Session {
-            id: id.clone(),
+            id,
             process,
             pending: Mutex::new(HashMap::new()),
             events,
             last_used: AtomicI64::new(now_ms()),
         });
-
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.insert(id, session.clone());
-        }
 
         let reader = Arc::downgrade(&session);
         let owner = self.me.clone();
@@ -188,6 +233,16 @@ impl StdioSource {
         Ok(session)
     }
 
+    async fn one_shot(&self) -> Result<Arc<Session>, UpstreamError> {
+        let session = self.spawn(None)?;
+        if let Err(error) = self.initialize(&session, porchlight_initialize()).await {
+            self.close(&session).await;
+            return Err(error);
+        }
+
+        Ok(session)
+    }
+
     async fn send(
         &self,
         session: &Session,
@@ -195,12 +250,24 @@ impl StdioSource {
         timeout: Duration,
     ) -> Result<Option<Value>, UpstreamError> {
         session.touch();
+        if message.get("method").and_then(Value::as_str) == Some("server/discover") {
+            return Ok(Some(rpc::rpc_result(
+                message.get("id"),
+                json!({
+                    "protocolVersions": ["2025-06-18", "2025-11-25", "2026-07-28"],
+                    "capabilities": { "tools": {}, "resources": {} },
+                    "serverInfo": { "name": self.spec.name, "version": crate::core::VERSION }
+                }),
+            )));
+        }
         let text = Value::Object(message.clone()).to_string();
         let is_request = message.get("method").is_some_and(Value::is_string) && message.contains_key("id");
 
         if !is_request {
-            session.process.write(&text).await?;
-            return Ok(None);
+            return match tokio::time::timeout(timeout, session.process.write(&text)).await {
+                Ok(result) => result.map(|()| None),
+                Err(_) => Ok(Some(rpc_error(message.get("id"), -32001, "Request timed out"))),
+            };
         }
 
         let id = message.get("id");
@@ -219,17 +286,19 @@ impl StdioSource {
             return Ok(Some(rpc_error(id, -32600, "A request with this id is already in progress")));
         }
 
-        if let Err(error) = session.process.write(&text).await {
-            if let Ok(mut pending) = session.pending.lock() {
-                pending.remove(&key);
+        let operation = async {
+            session.process.write(&text).await?;
+            Ok::<Option<Value>, UpstreamError>(receiver.await.ok())
+        };
+        let reply = match tokio::time::timeout(timeout, operation).await {
+            Ok(Ok(Some(value))) => value,
+            Ok(Ok(None)) => rpc_error(id, -32000, &format!("{} stopped", self.spec.name)),
+            Ok(Err(error)) => {
+                if let Ok(mut pending) = session.pending.lock() {
+                    pending.remove(&key);
+                }
+                return Err(error);
             }
-
-            return Err(error);
-        }
-
-        let reply = match tokio::time::timeout(timeout, receiver).await {
-            Ok(Ok(value)) => value,
-            Ok(Err(_)) => rpc_error(id, -32000, &format!("{} stopped", self.spec.name)),
             Err(_) => rpc_error(id, -32001, "Request timed out"),
         };
 
@@ -262,7 +331,7 @@ impl StdioSource {
         let Some(saved) = saved.filter(|saved| now_ms() - saved.last_used <= IDLE_TIMEOUT_MS) else {
             return Ok(None);
         };
-        let session = self.open(Some(id.to_owned()))?;
+        let session = self.open(Some(id.to_owned())).await?;
         let params = serde_json::from_str(&saved.initialize).unwrap_or_else(|_| porchlight_initialize());
 
         if let Err(error) = self.initialize(&session, params).await {
@@ -296,16 +365,29 @@ impl StdioSource {
         };
         let initialize = decoded.items.iter().find(|message| message.get("method") == Some(&json!("initialize")));
         let session_id = request.header("mcp-session-id");
+        if let (Some(message), Some(id)) = (initialize, session_id)
+            && self.find(id).await?.is_some()
+        {
+            return Ok(rpc::json(
+                &rpc_error(message.get("id"), -32600, "initialize cannot use an existing session"),
+                StatusCode::OK,
+            ));
+        }
+        let stateless = initialize.is_none() && session_id.is_none();
         let session = match (initialize, session_id) {
-            (Some(_), _) => Some(self.open(None)?),
-            (None, Some(id)) => self.find(id).await?,
-            (None, None) => None,
+            (Some(_), _) => self.open(None).await.map(Some),
+            (None, Some(id)) => self.find(id).await,
+            (None, None) => self.one_shot().await.map(Some),
         };
-        let Some(session) = session else {
-            return Ok(match session_id {
-                None => rpc::json(&rpc_error(None, -32000, "Missing Mcp-Session-Id header"), StatusCode::BAD_REQUEST),
-                Some(_) => rpc::json(&rpc_error(None, -32001, "Session not found"), StatusCode::NOT_FOUND),
-            });
+        let session = match session {
+            Ok(Some(session)) => session,
+            Ok(None) => return Ok(rpc::json(&rpc_error(None, -32001, "Session not found"), StatusCode::NOT_FOUND)),
+            Err(error) => {
+                let id = initialize
+                    .and_then(|message| message.get("id"))
+                    .or_else(|| decoded.items.first().and_then(|message| message.get("id")));
+                return Ok(rpc::json(&rpc_error(id, -32000, &error.message), StatusCode::OK));
+            }
         };
 
         if let Some(message) = initialize {
@@ -319,8 +401,28 @@ impl StdioSource {
         }
 
         let replies = join_all(decoded.items.iter().map(|message| self.send(&session, message, REQUEST_TIMEOUT))).await;
-        let answered: Vec<Value> = replies.into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect();
-        let body = match (decoded.batch, answered.into_iter().collect::<Vec<_>>()) {
+        if stateless {
+            self.close(&session).await;
+        }
+        let mut answered = Vec::new();
+        for reply in replies {
+            match reply {
+                Ok(Some(value)) => {
+                    if initialize.is_some() && value.get("result").is_none() {
+                        self.close(&session).await;
+                    }
+                    answered.push(value);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if initialize.is_some() {
+                        self.close(&session).await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let body = match (decoded.batch, answered) {
             (_, answered) if answered.is_empty() => None,
             (true, answered) => Some(Value::Array(answered)),
             (false, answered) => answered.into_iter().next(),
@@ -330,7 +432,7 @@ impl StdioSource {
             Some(body) => rpc::json(&body, StatusCode::OK),
         };
 
-        if let Ok(value) = HeaderValue::from_str(&session.id) {
+        if !stateless && let Ok(value) = HeaderValue::from_str(&session.id) {
             response.headers_mut().insert("mcp-session-id", value);
         }
 
@@ -370,14 +472,13 @@ impl StdioSource {
     }
 
     async fn handshake(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, UpstreamError> {
-        let session = self.open(None)?;
+        let session = self.spawn(None)?;
         let message = json!({ "jsonrpc": "2.0", "id": 2, "method": method, "params": params });
         let reply = match self.initialize(&session, porchlight_initialize()).await {
             Ok(()) => self.send(&session, message.as_object().unwrap_or(&Map::new()), timeout).await,
             Err(error) => Err(error),
         };
         self.close(&session).await;
-        let _ = self.store.stdio_session_remove(&session.id);
 
         Ok(reply?.unwrap_or(Value::Null))
     }
@@ -414,5 +515,73 @@ impl StdioSource {
         for session in self.all() {
             self.close(&session).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_blocked_stdin_write_is_bounded_by_the_request_timeout() {
+        let log_file = std::env::temp_dir().join(format!("porchlight-stdin-timeout-{}", std::process::id()));
+        let source = StdioSource::start(
+            StdioSpec {
+                name: "blocked".to_owned(),
+                command: vec!["/bin/sleep".to_owned(), "60".to_owned()],
+                env: IndexMap::new(),
+                cwd: None,
+                log_file,
+            },
+            Store::in_memory().unwrap(),
+        );
+        let session = source.open(None).await.unwrap();
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "large": "x".repeat(1024 * 1024) }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let reply = source.send(&session, &message, Duration::from_millis(50)).await.unwrap().unwrap();
+
+        assert_eq!(reply["error"]["message"], "Request timed out");
+        source.close(&session).await;
+        source.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_initialize_closes_the_new_session() {
+        let log_file = std::env::temp_dir().join(format!("porchlight-failed-init-{}", std::process::id()));
+        let source = StdioSource::start(
+            StdioSpec {
+                name: "failed-init".to_owned(),
+                command: vec!["/usr/bin/false".to_owned()],
+                env: IndexMap::new(),
+                cwd: None,
+                log_file,
+            },
+            Store::in_memory().unwrap(),
+        );
+        let request = SourceRequest {
+            method: Method::POST,
+            headers: http::HeaderMap::new(),
+            body: Bytes::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {}
+                })
+                .to_string(),
+            ),
+        };
+
+        let _ = source.post(&request).await;
+
+        assert_eq!(source.sessions_live.load(Ordering::Acquire), 0);
+        source.shutdown().await;
     }
 }

@@ -1,15 +1,16 @@
-use crate::auth::{ACCESS_TOKEN_SECONDS, Approval, Auth, AuthError, AuthorizationRequest, TokenPair};
+use crate::approval::summarize;
+use crate::auth::{ACCESS_TOKEN_SECONDS, Auth, AuthError, AuthorizationRequest, MAX_CODE_ATTEMPTS, TokenPair};
 use crate::client_metadata::{ClientIdentity, ClientMetadata, is_valid_redirect_uri, redirect_matches};
 use crate::core::{link_path, now_ms};
-use crate::crypto::random_token;
-use crate::links::ServerState;
-use crate::pages::{Message, RequestSummary, authorize_page, html_response, message_response, redirect_to};
+use crate::crypto::{random_token, sha256};
+use crate::pages::{Entry, Message, authorize_page, ended_page, html_response, message_response, redirect_to};
 use crate::registry::Registry;
-use crate::rpc::{empty, is_event_stream, json, text};
+use crate::rpc::{MAX_REQUEST_BODY, empty, form_params, is_event_stream, json, query_params, text};
 use crate::serve::{Daemon, Shared};
 use crate::sources::SourceRequest;
 use crate::store::{AuditFields, Store};
 use crate::surfaces::{Exchange, McpSurface, SurfaceError};
+use crate::system;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::response::Response;
@@ -20,8 +21,6 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
-
-pub const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -38,7 +37,7 @@ const CORS: [(&str, &str); 5] = [
     ("access-control-allow-methods", "GET, POST, DELETE, OPTIONS"),
     (
         "access-control-allow-headers",
-        "authorization, content-type, accept, mcp-session-id, mcp-protocol-version, last-event-id",
+        "authorization, content-type, accept, mcp-session-id, mcp-protocol-version, last-event-id, mcp-method, mcp-name",
     ),
     ("access-control-expose-headers", "www-authenticate, mcp-session-id, mcp-protocol-version"),
     ("access-control-max-age", "86400"),
@@ -80,33 +79,18 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         })
 }
 
-pub fn query_params(query: Option<&str>) -> HashMap<String, String> {
-    form_urlencoded::parse(query.unwrap_or_default().as_bytes()).into_owned().collect()
-}
-
-pub fn form_params(headers: &HeaderMap, body: &[u8]) -> HashMap<String, String> {
-    let is_json = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("application/json"));
-
-    if is_json {
-        return serde_json::from_slice::<serde_json::Map<String, Value>>(body)
-            .map(|fields| {
-                fields
-                    .into_iter()
-                    .filter_map(|(key, value)| value.as_str().map(|text| (key, text.to_owned())))
-                    .collect()
-            })
-            .unwrap_or_default();
-    }
-
-    form_urlencoded::parse(body).into_owned().collect()
-}
-
 struct Throttle {
     interval_ms: i64,
     last: Mutex<HashMap<String, i64>>,
+}
+
+fn refused(headers: &HeaderMap, body: &Value, message: &Message) -> Response {
+    let browser = headers
+        .get(header::ACCEPT)
+        .and_then(|accept| accept.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"));
+
+    if browser { message_response(StatusCode::BAD_REQUEST, message) } else { json(body, StatusCode::BAD_REQUEST) }
 }
 
 impl Throttle {
@@ -231,10 +215,6 @@ impl Gateway {
     }
 
     fn register(&self, headers: &HeaderMap, body: &[u8]) -> Result<Response, AuthError> {
-        if !self.auth.allow_registration(&source_of(headers))? {
-            return Ok(json(&json!({ "error": "rate_limited" }), StatusCode::TOO_MANY_REQUESTS));
-        }
-
         let Ok(registration) = serde_json::from_slice::<RegistrationRequest>(body) else {
             return Ok(json(&json!({ "error": "invalid_client_metadata" }), StatusCode::BAD_REQUEST));
         };
@@ -249,6 +229,9 @@ impl Gateway {
             return Ok(json(&json!({ "error": "public_clients_only" }), StatusCode::BAD_REQUEST));
         }
 
+        if !self.auth.allow_registration(&source_of(headers))? {
+            return Ok(json(&json!({ "error": "rate_limited" }), StatusCode::TOO_MANY_REQUESTS));
+        }
         let client_id = random_token(16);
         let name: Option<String> = registration
             .client_name
@@ -289,9 +272,14 @@ impl Gateway {
         let challenge = get("code_challenge");
 
         if get("response_type") != "code" || challenge.is_empty() || get("code_challenge_method") != "S256" {
-            return Ok(json(
+            return Ok(refused(
+                headers,
                 &json!({ "error": "invalid_request", "error_description": "response_type=code with S256 PKCE is required" }),
-                StatusCode::BAD_REQUEST,
+                &Message {
+                    title: "This app can't connect this way",
+                    detail: "It sent a connection request porchlight doesn't accept.",
+                    next: "Update the app, then add the connector again.",
+                },
             ));
         }
 
@@ -300,12 +288,28 @@ impl Gateway {
         let Some(server) =
             self.registry.links().into_iter().find(|link| resource == format!("{public_url}{}", link_path(&link.name)))
         else {
-            return Ok(json(&json!({ "error": "invalid_target" }), StatusCode::BAD_REQUEST));
+            return Ok(refused(
+                headers,
+                &json!({ "error": "invalid_target" }),
+                &Message {
+                    title: "Nothing is shared at this address",
+                    detail: "porchlight doesn't have a link at the address this app was given.",
+                    next: "Check the address in your MCP client. porchlight lists each link's address under Links.",
+                },
+            ));
         };
         let client_id = get("client_id");
         let redirect_uri = get("redirect_uri");
         let Some(client) = self.identify_client(&client_id, &redirect_uri).await? else {
-            return Ok(json(&json!({ "error": "invalid_redirect_uri" }), StatusCode::BAD_REQUEST));
+            return Ok(refused(
+                headers,
+                &json!({ "error": "invalid_redirect_uri" }),
+                &Message {
+                    title: "This app's details don't match",
+                    detail: "It asked to send you somewhere it didn't register.",
+                    next: "Remove the connector from your MCP client and add it again.",
+                },
+            ));
         };
         let request_id = random_token(12);
         let begun = self.auth.begin(
@@ -325,23 +329,26 @@ impl Gateway {
                 return Ok(message_response(
                     StatusCode::TOO_MANY_REQUESTS,
                     &Message {
-                        label: "slow down",
-                        title: "too many connection requests",
-                        detail: "porchlight limits new requests so nobody can guess their way in.",
-                        next: "wait a few minutes, then connect again from your mcp client",
+                        title: "Too many connection requests",
+                        detail: "Porchlight has received too many connection requests.",
+                        next: "Wait a few minutes, then connect again from your MCP client.",
                     },
                 ));
             }
             Err(error) => return Err(error),
         };
-        let summary = RequestSummary {
-            client,
-            server_name: server.name.clone(),
-            tool_count: (server.state == ServerState::Live).then_some(server.allowed.len()),
-            redirect_uri,
+        let Some(pending) = self.store.pending_get(&request_id)? else {
+            return Ok(ended_page(&client.name));
         };
-        let mut response =
-            html_response(&authorize_page(&request_id, &summary, self.daemon.approval_port), StatusCode::OK);
+        let summary = summarize(&self.registry, &pending, client).await;
+        let message = format!(
+            "{} wants to use {}. Code {} — type it on the device that's connecting.",
+            summary.client.label(),
+            summary.server_name,
+            pending.code
+        );
+        tokio::spawn(async move { system::notify("porchlight", &message).await });
+        let mut response = html_response(&authorize_page(&request_id, &summary, &Entry::Fresh), StatusCode::OK);
         let set_cookie = format!("{}={nonce}; Path=/; HttpOnly; Secure; SameSite=Lax", cookie_name(&request_id));
 
         if let Ok(value) = HeaderValue::from_str(&set_cookie) {
@@ -351,24 +358,53 @@ impl Gateway {
         Ok(response)
     }
 
-    fn complete(
+    async fn complete_code(
         &self,
         headers: &HeaderMap,
         params: &HashMap<String, String>,
-        secret: &str,
-        approve: impl Fn(&Auth, &str, &str, Option<&str>) -> Result<Approval, AuthError>,
-        failure: &Message,
     ) -> Result<Response, AuthError> {
         let request_id = params.get("req").cloned().unwrap_or_default();
+        let typed = params.get("code").cloned().unwrap_or_default();
         let nonce = cookie(headers, &cookie_name(&request_id));
-        let given = params.get(secret).cloned().unwrap_or_default();
+        let live = |request_id: &str| -> Result<_, AuthError> {
+            Ok(self.store.pending_get(request_id)?.filter(|pending| pending.expires_at >= now_ms()))
+        };
+        let Some(pending) = live(&request_id)? else {
+            return Ok(ended_page("your MCP client"));
+        };
+        let client =
+            self.client_metadata.identify(&pending.client_id, self.store.client_name(&pending.client_id)?).await;
 
-        match approve(&self.auth, &request_id, &given, nonce.as_deref()) {
-            Ok(approval) => Ok(redirect_to(
-                &approval.redirect_uri,
-                &[("code", &approval.code), ("state", &approval.state), ("iss", &self.daemon.public_url())],
-            )),
-            Err(AuthError::Refused(_)) => Ok(message_response(StatusCode::FORBIDDEN, failure)),
+        if nonce.as_deref().is_none_or(|nonce| sha256(nonce) != pending.nonce_hash) {
+            let summary = summarize(&self.registry, &pending, client).await;
+            return Ok(html_response(
+                &authorize_page(&request_id, &summary, &Entry::OtherBrowser),
+                StatusCode::FORBIDDEN,
+            ));
+        }
+
+        match self.auth.approve_with_code(&request_id, &typed, nonce.as_deref()) {
+            Ok(approval) => {
+                let server = self.registry.link(&pending.server).map_or(pending.server, |server| server.name);
+                let message = format!("{} is connected to {server}.", client.label());
+                tokio::spawn(async move { system::notify("porchlight", &message).await });
+
+                Ok(redirect_to(
+                    &approval.redirect_uri,
+                    &[("code", &approval.code), ("state", &approval.state), ("iss", &self.daemon.public_url())],
+                ))
+            }
+            Err(AuthError::Refused(_)) => match live(&request_id)? {
+                Some(pending) => {
+                    let tries_left = MAX_CODE_ATTEMPTS - pending.attempts;
+                    let summary = summarize(&self.registry, &pending, client).await;
+                    Ok(html_response(
+                        &authorize_page(&request_id, &summary, &Entry::Wrong { tries_left }),
+                        StatusCode::FORBIDDEN,
+                    ))
+                }
+                None => Ok(ended_page(&client.name)),
+            },
             Err(error) => Err(error),
         }
     }
@@ -376,7 +412,13 @@ impl Gateway {
     fn token(&self, params: &HashMap<String, String>) -> Result<Response, AuthError> {
         let get = |key: &str| params.get(key).map(String::as_str).unwrap_or_default();
         let pair: Result<TokenPair, AuthError> = match get("grant_type") {
-            "authorization_code" => self.auth.exchange_code(get("code"), get("code_verifier"), get("resource")),
+            "authorization_code" => self.auth.exchange_code(
+                get("code"),
+                get("code_verifier"),
+                get("resource"),
+                get("client_id"),
+                get("redirect_uri"),
+            ),
             "refresh_token" => self.auth.refresh(get("refresh_token")),
             _ => {
                 return Ok(json(&json!({ "error": "unsupported_grant_type" }), StatusCode::BAD_REQUEST));
@@ -549,37 +591,12 @@ async fn dispatch(gateway: &Gateway, request: Request) -> Response {
                 not_allowed()
             }
         }
-        ["oauth", "complete"] => {
-            if !is(&Method::GET) {
-                return not_allowed();
-            }
-
-            let failure = Message {
-                label: "approval failed",
-                title: "approval failed",
-                detail: "each approval link works once, and this one was already used or ran out.",
-                next: "go back to your mcp client and connect again",
-            };
-            settled(gateway.complete(&headers, &query_params(query), "g", Auth::approve_with_ticket, &failure))
-        }
         ["oauth", "complete-code"] => {
             if !is(&Method::POST) {
                 return not_allowed();
             }
 
-            let failure = Message {
-                label: "wrong code",
-                title: "that code didn't work",
-                detail: "each code works once and only for a few minutes. check for a typo, or get a fresh one.",
-                next: "open porchlight on the computer and get a new code from the clients tab",
-            };
-            settled(gateway.complete(
-                &headers,
-                &form_params(&headers, &body),
-                "code",
-                Auth::approve_with_code,
-                &failure,
-            ))
+            settled(gateway.complete_code(&headers, &form_params(&headers, &body)).await)
         }
         ["oauth", "token"] => {
             if is(&Method::POST) {

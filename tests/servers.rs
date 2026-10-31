@@ -7,17 +7,17 @@ use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use indexmap::IndexMap;
 use porchlight::approval::ApprovalPages;
-use porchlight::apps::{AppSpec, apps_from, host_environment};
+use porchlight::apps::{apps_from, host_environment};
 use porchlight::auth::Auth;
 use porchlight::client_metadata::ClientMetadata;
 use porchlight::config::{Config, Settings, decode_command_app};
-use porchlight::core::Problem;
 use porchlight::crypto::{pkce_challenge, random_token};
 use porchlight::gateway::{Gateway, bind};
 use porchlight::links::{LinkPlan, ServerState};
 use porchlight::policy::rules_from;
 use porchlight::registry::Registry;
-use porchlight::serve::{Daemon, Reload, Shared};
+use porchlight::serve::{Daemon, Shared};
+use porchlight::sources::AppSpec;
 use porchlight::sources::SourceSpec;
 use porchlight::store::Store;
 use serde_json::{Value, json};
@@ -139,18 +139,6 @@ async fn stoppable_upstream() -> (tokio::sync::oneshot::Sender<()>, u16) {
     (stop, port)
 }
 
-struct NoReload;
-
-impl Reload for NoReload {
-    fn reload(&self) -> futures::future::BoxFuture<'_, ()> {
-        Box::pin(async {})
-    }
-
-    fn problems(&self) -> Vec<Problem> {
-        Vec::new()
-    }
-}
-
 fn http_spec(name: &str, url: &str, allow_dangerous: bool) -> AppSpec {
     AppSpec {
         name: name.to_owned(),
@@ -235,7 +223,6 @@ struct Harness {
     gateway: String,
     approval: String,
     approval_port: u16,
-    config_path: std::path::PathBuf,
     tokens: HashMap<String, String>,
     expired: String,
     client: reqwest::Client,
@@ -290,7 +277,7 @@ impl Harness {
             config: Config::at(config_path.clone()),
         };
         Gateway::new(daemon.clone(), shared.clone()).unwrap().serve(gateway_listener);
-        ApprovalPages::new(daemon.clone(), Arc::new(NoReload), shared.clone()).serve(approval_listener);
+        ApprovalPages::new(daemon.clone(), shared.clone()).serve(approval_listener);
         let tokens = ["paper", "split", "allowlist", "fixture", "vault", "home"]
             .into_iter()
             .map(|link| (link.to_owned(), auth.create_static_token(link, "test", 60_000).unwrap().1))
@@ -306,7 +293,6 @@ impl Harness {
             gateway: format!("http://127.0.0.1:{gateway_port}"),
             approval: format!("http://127.0.0.1:{approval_port}"),
             approval_port,
-            config_path,
             tokens,
             expired,
             client: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap(),
@@ -560,7 +546,6 @@ async fn the_gateway_never_serves_the_approval_page_or_the_local_page() {
 
     assert_eq!(status("/approve?req=x", false).await, 404);
     assert_eq!(status("/", false).await, 404);
-    assert_eq!(status("/toggle", true).await, 404);
 }
 
 #[tokio::test]
@@ -593,7 +578,7 @@ async fn forwards_allowed_calls_without_credentials_or_unknown_headers() {
 
 const REDIRECT_URI: &str = "https://claude.ai/callback";
 
-const VERIFIER: &str = "a-verifier-that-only-this-client-knows";
+const VERIFIER: &str = "a-verifier-that-only-this-client-knows-and-is-long-enough";
 
 const RESOURCE: &str = "https://tunnel.example/paper/mcp";
 
@@ -621,25 +606,39 @@ impl Harness {
             ("resource", RESOURCE),
             ("state", "opaque"),
         ];
-        let page = self.client.get(format!("{}/oauth/authorize", self.gateway)).query(&query).send().await.unwrap();
-        let cookie = page.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
+        let response = self.client.get(format!("{}/oauth/authorize", self.gateway)).query(&query).send().await.unwrap();
+        let cookie = response.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
         let request_id = cookie.strip_prefix("__Host-pl_").unwrap().split('=').next().unwrap().to_owned();
 
         (cookie, request_id)
     }
 
-    fn complete_link(&self, request_id: &str, ticket: &str) -> String {
-        format!("{}/oauth/complete?req={request_id}&g={ticket}", self.gateway)
+    fn code_of(&self, request_id: &str) -> String {
+        self.shared.store.pending_get(request_id).unwrap().unwrap().code
     }
 
-    async fn open_link(&self, link: &str, cookie: Option<&str>) -> reqwest::Response {
-        let mut request = self.client.get(link);
+    async fn enter_code(&self, request_id: &str, code: &str, cookie: Option<&str>) -> reqwest::Response {
+        let mut request = self
+            .client
+            .post(format!("{}/oauth/complete-code", self.gateway))
+            .form(&[("req", request_id), ("code", code)]);
 
         if let Some(cookie) = cookie {
             request = request.header("cookie", cookie);
         }
 
         request.send().await.unwrap()
+    }
+
+    async fn code_page(&self, request_id: &str) -> String {
+        self.client
+            .get(format!("{}/approve?req={request_id}", self.approval))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
     }
 
     async fn token_request(&self, fields: &[(&str, &str)]) -> (u16, Value) {
@@ -649,8 +648,8 @@ impl Harness {
 
     async fn connect(&self) -> (url::Url, String, String) {
         let (cookie, request_id) = self.start_connecting().await;
-        let ticket = self.auth.issue_ticket(&request_id);
-        let redirect = self.open_link(&self.complete_link(&request_id, &ticket), Some(&cookie)).await;
+        let client_id = self.shared.store.pending_get(&request_id).unwrap().unwrap().client_id;
+        let redirect = self.enter_code(&request_id, &self.code_of(&request_id), Some(&cookie)).await;
         let location = url::Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
         let code = location.query_pairs().find(|(name, _)| name == "code").unwrap().1.into_owned();
         let (_, body) = self
@@ -659,6 +658,8 @@ impl Harness {
                 ("code", &code),
                 ("code_verifier", VERIFIER),
                 ("resource", RESOURCE),
+                ("client_id", &client_id),
+                ("redirect_uri", REDIRECT_URI),
             ])
             .await;
 
@@ -682,21 +683,59 @@ async fn a_connected_client_can_use_only_the_server_it_was_approved_for() {
 }
 
 #[tokio::test]
-async fn an_approval_link_fails_without_the_requesters_cookie_and_is_burned() {
+async fn the_right_code_in_another_browser_is_refused_without_using_up_a_try() {
     let harness = Harness::start().await;
     let (cookie, request_id) = harness.start_connecting().await;
-    let link = harness.complete_link(&request_id, &harness.auth.issue_ticket(&request_id));
+    let code = harness.code_of(&request_id);
+    let elsewhere = harness.enter_code(&request_id, &code, None).await;
 
-    assert_eq!(harness.open_link(&link, None).await.status(), 403);
-    assert_eq!(harness.open_link(&link, Some(&cookie)).await.status(), 403);
+    assert_eq!(elsewhere.status(), 403);
+    assert!(elsewhere.text().await.unwrap().contains("only works in the browser"));
+    assert_eq!(harness.shared.store.pending_get(&request_id).unwrap().unwrap().attempts, 0);
+    assert_eq!(harness.enter_code(&request_id, &code, Some(&cookie)).await.status(), 302);
+    assert_eq!(harness.enter_code(&request_id, &code, Some(&cookie)).await.status(), 410);
+}
+
+#[tokio::test]
+async fn a_wrong_code_keeps_the_page_and_the_fifth_ends_the_request_on_both_devices() {
+    let harness = Harness::start().await;
+    let (cookie, request_id) = harness.start_connecting().await;
+    let first = harness.enter_code(&request_id, "WRNG-CODE", Some(&cookie)).await;
+
+    assert_eq!(first.status(), 403);
+    let page = first.text().await.unwrap();
+    assert!(page.contains("4 tries left"));
+    assert!(page.contains("name=\"code\" value=\"\""));
+    assert!(!page.contains("WRNGCODE"));
+    assert!(harness.code_page(&request_id).await.contains("A wrong code was entered 1 time"));
+
+    for _ in 0..4 {
+        harness.enter_code(&request_id, "WRNG-CODE", Some(&cookie)).await;
+    }
+
+    assert!(harness.shared.store.pending_get(&request_id).unwrap().is_none());
+    assert_eq!(harness.enter_code(&request_id, "WRNG-CODE", Some(&cookie)).await.status(), 410);
+    assert!(harness.code_page(&request_id).await.contains("This request has ended"));
+}
+
+#[tokio::test]
+async fn the_code_view_turns_into_connected_once_the_device_enters_the_code() {
+    let harness = Harness::start().await;
+    let (cookie, request_id) = harness.start_connecting().await;
+    let waiting = harness.code_page(&request_id).await;
+
+    assert!(waiting.contains(&harness.code_of(&request_id)));
+    assert!(waiting.contains("http-equiv=\"refresh\""));
+    assert!(!waiting.contains("Allow"));
+    harness.enter_code(&request_id, &harness.code_of(&request_id), Some(&cookie)).await;
+    assert!(harness.code_page(&request_id).await.contains("is connected to"));
 }
 
 #[tokio::test]
 async fn a_code_cant_be_exchanged_without_the_pkce_verifier() {
     let harness = Harness::start().await;
     let (cookie, request_id) = harness.start_connecting().await;
-    let link = harness.complete_link(&request_id, &harness.auth.issue_ticket(&request_id));
-    let redirect = harness.open_link(&link, Some(&cookie)).await;
+    let redirect = harness.enter_code(&request_id, &harness.code_of(&request_id), Some(&cookie)).await;
     let location = url::Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
     let code = location.query_pairs().find(|(name, _)| name == "code").unwrap().1.into_owned();
     let stolen = harness
@@ -729,38 +768,29 @@ async fn the_approval_page_lists_the_tools_that_will_be_shared_and_no_hidden_one
     assert!(page.contains("<code>write_html</code>"));
     assert!(!page.contains("delete_nodes"));
 }
-
 fn csrf_of(page: &str) -> String {
     page.split("name=\"csrf\" value=\"").nth(1).unwrap().split('"').next().unwrap().to_owned()
 }
 
 #[tokio::test]
-async fn denying_on_the_approval_page_sends_the_client_back_with_access_denied_and_ends_the_request() {
+async fn denying_in_the_code_view_ends_the_request_without_redirecting_this_browser() {
     let harness = Harness::start().await;
     let (cookie, request_id) = harness.start_connecting().await;
-    let page = harness
-        .client
-        .get(format!("{}/approve?req={request_id}", harness.approval))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let code = harness.code_of(&request_id);
+    let page = harness.code_page(&request_id).await;
     let denied = harness
         .client
-        .post(format!("{}/approve", harness.approval))
+        .post(format!("{}/deny", harness.approval))
         .header("origin", &harness.approval)
-        .form(&[("req", request_id.as_str()), ("csrf", &csrf_of(&page)), ("decision", "deny")])
+        .form(&[("req", request_id.as_str()), ("csrf", &csrf_of(&page))])
         .send()
         .await
         .unwrap();
-    let location = url::Url::parse(denied.headers()["location"].to_str().unwrap()).unwrap();
-    let link = harness.complete_link(&request_id, &harness.auth.issue_ticket(&request_id));
 
-    assert!(location.as_str().starts_with(REDIRECT_URI));
-    assert!(location.query_pairs().any(|(name, value)| name == "error" && value == "access_denied"));
-    assert_eq!(harness.open_link(&link, Some(&cookie)).await.status(), 403);
+    assert_eq!(denied.status(), 200);
+    assert!(denied.headers().get("location").is_none());
+    assert!(denied.text().await.unwrap().contains("Denied"));
+    assert_eq!(harness.enter_code(&request_id, &code, Some(&cookie)).await.status(), 410);
 }
 
 #[tokio::test]
@@ -1079,9 +1109,9 @@ async fn the_approval_listener_rejects_a_cross_origin_post() {
     let harness = Harness::start().await;
     let response = harness
         .client
-        .post(format!("{}/approve", harness.approval))
+        .post(format!("{}/deny", harness.approval))
         .header("origin", "https://tunnel.example")
-        .form(&[("req", "x"), ("csrf", "y"), ("decision", "allow")])
+        .form(&[("req", "x"), ("csrf", "y")])
         .send()
         .await
         .unwrap();
@@ -1091,46 +1121,123 @@ async fn the_approval_listener_rejects_a_cross_origin_post() {
 }
 
 #[tokio::test]
-async fn the_local_pages_switches_refuse_other_sites_and_forms_without_its_token() {
+async fn stateless_stdio_requests_are_answered_by_a_porchlight_initialized_process_and_server_discover() {
     let harness = Harness::start().await;
-    let page = harness.client.get(format!("{}/", harness.approval)).send().await.unwrap();
-    assert_eq!(page.status(), 200);
-    let csrf = csrf_of(&page.text().await.unwrap());
-    let toggle = |origin: &'static str, fields: Vec<(&'static str, String)>| {
-        let origin = if origin.is_empty() { harness.approval.clone() } else { origin.to_owned() };
-        let request =
-            harness.client.post(format!("{}/toggle", harness.approval)).header("origin", origin).form(&fields);
-        async move { request.send().await.unwrap().status().as_u16() }
+    let token = harness.token("fixture");
+    let post = |method: &str| {
+        harness
+            .client
+            .post(format!("{}/fixture/mcp", harness.gateway))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": method,
+                    "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } }
+                })
+                .to_string(),
+            )
     };
-    let target = || ("target", "paper/write_html".to_owned());
-    let off = || ("on", "false".to_owned());
+    let tools = post("tools/list").send().await.unwrap();
+    let tools: Value = tools.json().await.unwrap();
+    let discovery: Value = post("server/discover").send().await.unwrap().json().await.unwrap();
 
-    assert_eq!(toggle("https://tunnel.example", vec![("csrf", csrf.clone()), target(), off()]).await, 403);
-    assert_eq!(toggle("", vec![target(), off()]).await, 403);
-    assert_eq!(toggle("", vec![("csrf", "guess".to_owned()), target(), off()]).await, 403);
-    assert_eq!(toggle("", vec![("csrf", csrf), target(), off()]).await, 303);
-    assert!(std::fs::read_to_string(&harness.config_path).unwrap().contains("\"paper/write_html\": false"));
+    assert_eq!(tools["result"]["tools"][0]["name"], "echo");
+    assert!(discovery["result"]["protocolVersions"].as_array().unwrap().contains(&json!("2026-07-28")));
 }
 
 #[tokio::test]
-async fn the_local_page_can_turn_a_disabled_mcp_app_back_on() {
+async fn stdio_requests_without_a_session_never_share_a_process() {
     let harness = Harness::start().await;
-    std::fs::write(
-        &harness.config_path,
-        json!({ "mcp": { "disabled": { "url": "http://127.0.0.1:9/mcp", "enabled": false } } }).to_string(),
-    )
-    .unwrap();
-    let html = harness.client.get(format!("{}/", harness.approval)).send().await.unwrap().text().await.unwrap();
-    let response = harness
-        .client
-        .post(format!("{}/toggle", harness.approval))
-        .header("origin", &harness.approval)
-        .form(&[("csrf", csrf_of(&html).as_str()), ("target", "mcp:disabled"), ("on", "true")])
-        .send()
-        .await
-        .unwrap();
-    let settings = Config::at(harness.config_path.clone()).load().unwrap().settings;
+    let first = harness.rpc("fixture", "tools/call", json!({ "name": "echo" })).await;
+    assert!(first.headers().get("mcp-session-id").is_none());
+    let first = pid_of(&first.text().await.unwrap());
+    let second = pid_of(&harness.text("fixture", "tools/call", json!({ "name": "echo" })).await);
 
-    assert_eq!(response.status(), 303);
-    assert!(settings.mcp["disabled"].enabled());
+    assert_ne!(first, second);
+}
+
+#[tokio::test]
+async fn full_stdio_sessions_evict_the_idlest_and_initialize_rejects_an_existing_session() {
+    let harness = Harness::start().await;
+    let token = harness.token("fixture");
+    let mut sessions = Vec::new();
+
+    for _ in 0..9 {
+        let initialized = harness.rpc("fixture", "initialize", json!({})).await;
+        sessions.push(initialized.headers()["mcp-session-id"].to_str().unwrap().to_owned());
+    }
+
+    let resumed =
+        harness.rpc_with("fixture", &token, "tools/list", json!({}), &[("mcp-session-id", &sessions[0])]).await;
+    let resumed: Value = resumed.json().await.unwrap();
+    assert!(resumed["result"]["tools"].is_array());
+
+    let reused =
+        harness.rpc_with("fixture", &token, "initialize", json!({}), &[("mcp-session-id", &sessions[0])]).await;
+    let reused: Value = reused.json().await.unwrap();
+    assert_eq!(reused["error"]["code"], -32600);
+
+    for session in sessions {
+        harness.end_session(&session).await;
+    }
+}
+
+#[tokio::test]
+async fn command_discovery_and_cacheable_results_include_2026_metadata() {
+    let harness = Harness::start().await;
+    let discovery = harness.json("home", "server/discover", json!({})).await;
+    let tools = harness.json("home", "tools/list", json!({})).await;
+    let resources = harness.json("home", "resources/list", json!({})).await;
+
+    assert!(discovery["result"]["protocolVersions"].as_array().unwrap().contains(&json!("2026-07-28")));
+    assert_eq!(tools["result"]["resultType"], "complete");
+    assert_eq!(tools["result"]["cacheScope"], "private");
+    assert!(tools["result"]["ttlMs"].is_number());
+    assert_eq!(resources["result"]["cacheScope"], "private");
+}
+
+#[tokio::test]
+async fn upstream_tool_names_outside_mcp_guidance_are_reported_hidden_and_refused() {
+    let mut harness = Harness::start().await;
+    *harness.upstream.dynamic.lock().unwrap() = vec![json!({ "name": "files/read" })];
+    let mut specs: Vec<AppSpec> = harness.registry.list().iter().map(|app| app.spec.clone()).collect();
+    specs.push(http_spec("dynamic", &format!("http://127.0.0.1:{}/dynamic/mcp", harness.upstream_port), false));
+    let mut plans = base_links();
+    plans.push(direct("dynamic"));
+    harness.registry.sync(specs, plans).await;
+    reaches(&harness.registry, "dynamic", ServerState::Live).await;
+    harness.tokens.insert("dynamic".to_owned(), harness.auth.create_static_token("dynamic", "test", 60_000).unwrap().1);
+    let entry = harness.registry.get("dynamic").unwrap();
+    let listed = harness.text("dynamic", "tools/list", json!({})).await;
+    let called = harness.json("dynamic", "tools/call", json!({ "name": "files/read" })).await;
+
+    assert!(entry.detail.contains("files/read"));
+    assert!(entry.tools.is_empty());
+    assert!(!listed.contains("files/read"));
+    assert_eq!(called["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn live_tool_list_reclassifies_new_dangerous_definitions_for_the_link() {
+    let mut harness = Harness::start().await;
+    *harness.upstream.dynamic.lock().unwrap() = vec![json!({ "name": "lookup" })];
+    let mut specs: Vec<AppSpec> = harness.registry.list().iter().map(|app| app.spec.clone()).collect();
+    specs.push(http_spec("dynamic", &format!("http://127.0.0.1:{}/dynamic/mcp", harness.upstream_port), false));
+    let mut plans = base_links();
+    plans.push(direct("dynamic"));
+    harness.registry.sync(specs, plans).await;
+    reaches(&harness.registry, "dynamic", ServerState::Live).await;
+    harness.tokens.insert("dynamic".to_owned(), harness.auth.create_static_token("dynamic", "test", 60_000).unwrap().1);
+    *harness.upstream.dynamic.lock().unwrap() = vec![json!({ "name": "run_shell" })];
+
+    let listed = harness.text("dynamic", "tools/list", json!({})).await;
+    let before_call = harness.received();
+    let called = harness.json("dynamic", "tools/call", json!({ "name": "run_shell" })).await;
+
+    assert!(!listed.contains("run_shell"));
+    assert_eq!(called["error"]["code"], -32602);
+    assert_eq!(harness.received(), before_call);
 }

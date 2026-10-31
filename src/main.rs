@@ -1,21 +1,8 @@
 use clap::Parser;
-use porchlight::cli::Command;
+use porchlight::cli::Cli;
 use porchlight::exit::{ExitCode, ExitError};
-use std::io::IsTerminal;
-
-#[derive(Parser)]
-#[command(
-    name = "porchlight",
-    version,
-    about = "Share MCP servers and command-line tools on this computer with MCP clients. You approve every client.",
-    after_help = "Run porchlight on its own to open the full-screen app."
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-    #[arg(short, long, global = true, help = "print JSON for scripts")]
-    json: bool,
-}
+use serde_json::json;
+use std::io::{IsTerminal, Write};
 
 async fn run(cli: Cli) -> Result<(), ExitError> {
     match cli.command {
@@ -28,15 +15,50 @@ async fn run(cli: Cli) -> Result<(), ExitError> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    match run(Cli::parse()).await {
+    let json_output = std::env::args()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--json" || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('j')));
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) =>
+        {
+            let _ = write!(std::io::stdout(), "{error}");
+            return std::process::ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            if json_output {
+                eprintln!(
+                    "{}",
+                    json!({"ok": false, "error": error.to_string(), "next": "Use porchlight --help.", "exit": 2})
+                );
+            } else {
+                eprint!("{error}");
+            }
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let json_output = cli.json;
+    match run(cli).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("✗ {}", error.message);
-
-            if let Some(next) = &error.next_action {
-                eprintln!("  {next}");
+            if json_output {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "ok": false,
+                        "error": error.message,
+                        "next": error.next_action,
+                        "exit": error.code.value()
+                    })
+                );
+            } else {
+                eprintln!("✗ {}", error.message);
+                if let Some(next) = &error.next_action {
+                    eprintln!("  {next}");
+                }
             }
-
             std::process::ExitCode::from(error.code.value())
         }
     }

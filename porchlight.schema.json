@@ -159,55 +159,11 @@
                       "description": "The only values allowed"
                     },
                     "min": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
-                          "type": "string",
-                          "enum": [
-                            "NaN"
-                          ]
-                        },
-                        {
-                          "type": "string",
-                          "enum": [
-                            "Infinity"
-                          ]
-                        },
-                        {
-                          "type": "string",
-                          "enum": [
-                            "-Infinity"
-                          ]
-                        }
-                      ],
+                      "type": "number",
                       "description": "Smallest number allowed"
                     },
                     "max": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
-                          "type": "string",
-                          "enum": [
-                            "NaN"
-                          ]
-                        },
-                        {
-                          "type": "string",
-                          "enum": [
-                            "Infinity"
-                          ]
-                        },
-                        {
-                          "type": "string",
-                          "enum": [
-                            "-Infinity"
-                          ]
-                        }
-                      ],
+                      "type": "number",
                       "description": "Largest number allowed"
                     },
                     "optional": {
@@ -333,55 +289,11 @@
                             "description": "The only values allowed"
                           },
                           "min": {
-                            "anyOf": [
-                              {
-                                "type": "number"
-                              },
-                              {
-                                "type": "string",
-                                "enum": [
-                                  "NaN"
-                                ]
-                              },
-                              {
-                                "type": "string",
-                                "enum": [
-                                  "Infinity"
-                                ]
-                              },
-                              {
-                                "type": "string",
-                                "enum": [
-                                  "-Infinity"
-                                ]
-                              }
-                            ],
+                            "type": "number",
                             "description": "Smallest number allowed"
                           },
                           "max": {
-                            "anyOf": [
-                              {
-                                "type": "number"
-                              },
-                              {
-                                "type": "string",
-                                "enum": [
-                                  "NaN"
-                                ]
-                              },
-                              {
-                                "type": "string",
-                                "enum": [
-                                  "Infinity"
-                                ]
-                              },
-                              {
-                                "type": "string",
-                                "enum": [
-                                  "-Infinity"
-                                ]
-                              }
-                            ],
+                            "type": "number",
                             "description": "Largest number allowed"
                           },
                           "optional": {

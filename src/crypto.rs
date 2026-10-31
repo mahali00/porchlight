@@ -1,5 +1,5 @@
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -46,6 +46,10 @@ pub fn hmac(key: &str, value: &str) -> String {
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
+pub fn script_hash(source: &str) -> String {
+    format!("'sha256-{}'", STANDARD.encode(Sha256::digest(source.as_bytes())))
+}
+
 pub fn safe_equal(left: &str, right: &str) -> bool {
     left.len() == right.len() && bool::from(left.as_bytes().ct_eq(right.as_bytes()))
 }
@@ -55,10 +59,17 @@ pub fn pkce_challenge(verifier: &str) -> String {
 }
 
 pub fn approval_code() -> String {
-    (0..8)
-        .filter_map(|_| CODE_ALPHABET.get(rand::random_range(0..CODE_ALPHABET.len())))
-        .map(|byte| char::from(*byte))
-        .collect()
+    let mut code = String::with_capacity(9);
+
+    for byte in (0..8).filter_map(|_| CODE_ALPHABET.get(rand::random_range(0..CODE_ALPHABET.len()))) {
+        if code.len() == 4 {
+            code.push('-');
+        }
+
+        code.push(char::from(*byte));
+    }
+
+    code
 }
 
 pub fn normalize_code(code: &str) -> String {

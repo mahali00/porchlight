@@ -1,4 +1,4 @@
-use crate::config::in_state_dir;
+use crate::core::in_state_dir;
 use crate::core::now_ms;
 use crate::crypto::random_token;
 use rusqlite::{Connection, OptionalExtension, Row, named_params, params};
@@ -21,7 +21,6 @@ fn failed(message: &str) -> impl FnOnce(rusqlite::Error) -> StoreError + '_ {
 }
 
 const SCHEMA: &str = "
-  PRAGMA journal_mode = WAL;
   CREATE TABLE IF NOT EXISTS clients (
     id TEXT PRIMARY KEY,
     redirect_uris TEXT NOT NULL,
@@ -51,7 +50,7 @@ const SCHEMA: &str = "
     challenge TEXT NOT NULL,
     nonce_hash TEXT NOT NULL,
     state TEXT DEFAULT '',
-    code_hash TEXT DEFAULT NULL,
+    code TEXT NOT NULL,
     attempts INTEGER DEFAULT 0,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
@@ -85,7 +84,7 @@ const SCHEMA: &str = "
   );
 ";
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingRequest {
@@ -96,7 +95,7 @@ pub struct PendingRequest {
     pub challenge: String,
     pub nonce_hash: String,
     pub state: String,
-    pub code_hash: Option<String>,
+    pub code: String,
     pub attempts: i64,
     pub created_at: i64,
     pub expires_at: i64,
@@ -111,6 +110,7 @@ pub struct NewPending {
     pub challenge: String,
     pub nonce_hash: String,
     pub state: String,
+    pub code: String,
     pub expires_at: i64,
 }
 
@@ -259,7 +259,7 @@ pub struct Registrations {
 }
 
 const PENDING_COLUMNS: &str =
-    "id, client_id, server, redirect_uri, challenge, nonce_hash, state, code_hash, attempts, created_at, expires_at";
+    "id, client_id, server, redirect_uri, challenge, nonce_hash, state, code, attempts, created_at, expires_at";
 
 const TOKEN_COLUMNS: &str = "hash, kind, family, server, expires_at, revoked";
 
@@ -276,7 +276,7 @@ fn pending_row(row: &Row) -> rusqlite::Result<PendingRequest> {
         challenge: row.get(4)?,
         nonce_hash: row.get(5)?,
         state: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-        code_hash: row.get(7)?,
+        code: row.get(7)?,
         attempts: row.get::<_, Option<i64>>(8)?.unwrap_or_default(),
         created_at: row.get(9)?,
         expires_at: row.get(10)?,
@@ -344,24 +344,38 @@ fn restrict_to_owner(file: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn prepare(connection: &Connection) -> rusqlite::Result<()> {
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+fn use_wal(connection: &Connection) -> rusqlite::Result<()> {
+    let mut attempts = 0;
 
-    if version != SCHEMA_VERSION {
-        let tables: Vec<String> = connection
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name != 'sqlite_sequence'")?
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-
-        for table in tables {
-            connection.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", table.replace('"', "\"\"")))?;
+    loop {
+        match connection.execute_batch("PRAGMA journal_mode = WAL") {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy && attempts < 250 =>
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
         }
+    }
+}
 
-        connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+fn prepare(connection: &mut Connection) -> rusqlite::Result<()> {
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    use_wal(connection)?;
+    let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+    match version {
+        0 | SCHEMA_VERSION => {}
+        2 => transaction.execute_batch("DROP TABLE IF EXISTS pending")?,
+        other => return Err(rusqlite::Error::InvalidParameterName(format!("Unsupported database version {other}"))),
     }
 
-    connection.execute_batch(SCHEMA)
+    transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+
+    transaction.execute_batch(SCHEMA)?;
+    transaction.commit()
 }
 
 #[derive(Clone)]
@@ -373,8 +387,8 @@ impl Store {
     pub fn open(file: &Path) -> Result<Self, StoreError> {
         let message = format!("Failed to open {}", file.display());
         restrict_to_owner(file).map_err(|_| StoreError { message: message.clone(), cause: None })?;
-        let connection = Connection::open(file).map_err(failed(&message))?;
-        prepare(&connection).map_err(failed(&message))?;
+        let mut connection = Connection::open(file).map_err(failed(&message))?;
+        prepare(&mut connection).map_err(failed(&message))?;
 
         Ok(Self { db: Arc::new(Mutex::new(connection)) })
     }
@@ -384,8 +398,8 @@ impl Store {
     }
 
     pub fn in_memory() -> Result<Self, StoreError> {
-        let connection = Connection::open_in_memory().map_err(failed("Failed to open the database"))?;
-        prepare(&connection).map_err(failed("Failed to open the database"))?;
+        let mut connection = Connection::open_in_memory().map_err(failed("Failed to open the database"))?;
+        prepare(&mut connection).map_err(failed("Failed to open the database"))?;
 
         Ok(Self { db: Arc::new(Mutex::new(connection)) })
     }
@@ -517,8 +531,8 @@ impl Store {
     pub fn pending_create(&self, request: &NewPending) -> Result<(), StoreError> {
         self.with("Failed to store pending request", |db| {
             db.execute(
-                "INSERT INTO pending (id, client_id, server, redirect_uri, challenge, nonce_hash, state, created_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO pending (id, client_id, server, redirect_uri, challenge, nonce_hash, state, code, created_at, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     request.id,
                     request.client_id,
@@ -527,6 +541,7 @@ impl Store {
                     request.challenge,
                     request.nonce_hash,
                     request.state,
+                    request.code,
                     now_ms(),
                     request.expires_at
                 ],
@@ -546,16 +561,6 @@ impl Store {
             db.prepare(&format!("SELECT {PENDING_COLUMNS} FROM pending ORDER BY created_at DESC"))?
                 .query_map([], pending_row)?
                 .collect()
-        })
-    }
-
-    pub fn pending_set_code(&self, id: &str, code_hash: &str, expires_at: i64) -> Result<(), StoreError> {
-        self.with("Failed to store approval code", |db| {
-            db.execute(
-                "UPDATE pending SET code_hash = ?, attempts = 0, expires_at = MIN(expires_at, ?) WHERE id = ?",
-                params![code_hash, expires_at, id],
-            )
-            .map(drop)
         })
     }
 
@@ -721,19 +726,29 @@ impl Store {
         self.with("Failed to delete grants", |db| db.execute("DELETE FROM grants WHERE server = ?", [server]))
     }
 
-    pub fn registration_record(&self, ip: &str) -> Result<(), StoreError> {
+    pub fn registration_try_record(
+        &self,
+        ip: &str,
+        since: i64,
+        source_limit: i64,
+        global_limit: i64,
+    ) -> Result<bool, StoreError> {
         self.with("Failed to record registration", |db| {
-            db.execute("INSERT INTO dcr_hits (ip, at) VALUES (?, ?)", params![ip, now_ms()]).map(drop)
+            db.execute("DELETE FROM dcr_hits WHERE at < ?", [since])?;
+            let from_ip: i64 = db.query_row("SELECT COUNT(*) FROM dcr_hits WHERE ip = ?", [ip], |row| row.get(0))?;
+            let total: i64 = db.query_row("SELECT COUNT(*) FROM dcr_hits", [], |row| row.get(0))?;
+
+            if from_ip >= source_limit || total >= global_limit {
+                return Ok(false);
+            }
+
+            db.execute("INSERT INTO dcr_hits (ip, at) VALUES (?, ?)", params![ip, now_ms()]).map(|_| true)
         })
     }
 
-    pub fn registrations_since(&self, ip: &str, since: i64) -> Result<Registrations, StoreError> {
-        self.with("Failed to count registrations", |db| {
-            db.execute("DELETE FROM dcr_hits WHERE at < ?", [since])?;
-            let from_ip = db.query_row("SELECT COUNT(*) FROM dcr_hits WHERE ip = ?", [ip], |row| row.get(0))?;
-            let total = db.query_row("SELECT COUNT(*) FROM dcr_hits", [], |row| row.get(0))?;
-
-            Ok(Registrations { from_ip, total })
+    pub fn grant_exists(&self, id: &str) -> Result<bool, StoreError> {
+        self.with("Failed to read grant", |db| {
+            db.query_row("SELECT EXISTS(SELECT 1 FROM grants WHERE id = ?)", [id], |row| row.get(0))
         })
     }
 

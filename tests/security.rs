@@ -1,13 +1,19 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use indexmap::IndexMap;
-use porchlight::apps::{AppSpec, Environment, apps_from};
+use porchlight::apps::{Environment, apps_from};
 use porchlight::auth::{Auth, AuthError, AuthorizationRequest};
+use porchlight::config::Input;
 use porchlight::config::{Settings, decode_command_app};
 use porchlight::core::now_ms;
-use porchlight::crypto::{pkce_challenge, sha256};
-use porchlight::sources::commands::{CommandSource, CommandsSpec, fill, inputs_of, literal, runs_client_code};
+use porchlight::crypto::{pkce_challenge, random_token, sha256};
+use porchlight::policy::Level;
+use porchlight::sources::AppSpec;
+use porchlight::sources::commands::{
+    CommandSource, CommandsSpec, assess, command_tools, fill, inputs_of, literal, runs_client_code,
+};
 use porchlight::sources::{SourceRequest, SourceSpec};
+use porchlight::spec::template_words;
 use porchlight::store::{Store, TokenKind};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -32,7 +38,7 @@ fn begin(auth: &Auth, request_id: &str) -> Result<String, AuthError> {
             client_id: "claude".to_owned(),
             server: "paper".to_owned(),
             redirect_uri: "https://claude.ai/callback".to_owned(),
-            challenge: pkce_challenge("verifier"),
+            challenge: pkce_challenge("verifier-012345678901234567890123456789012345"),
             state: String::new(),
         },
         "203.0.113.9",
@@ -41,7 +47,7 @@ fn begin(auth: &Auth, request_id: &str) -> Result<String, AuthError> {
 
 fn guess_then_enter(auth: &Auth, request_id: &str, wrong: usize) -> Result<String, AuthError> {
     let nonce = begin(auth, request_id)?;
-    let code = auth.issue_device_code(request_id)?;
+    let code = auth.store().pending_get(request_id)?.map(|request| request.code).unwrap_or_default();
 
     for _ in 0..wrong {
         assert!(auth.approve_with_code(request_id, "WRONG123", Some(&nonce)).is_err());
@@ -51,24 +57,65 @@ fn guess_then_enter(auth: &Auth, request_id: &str, wrong: usize) -> Result<Strin
 }
 
 #[test]
-fn a_device_code_still_works_after_four_wrong_attempts() {
+fn a_pending_request_always_has_a_code_and_a_wrong_code_is_refused() {
+    let auth = auth();
+    let nonce = begin(&auth, "wrong-code").unwrap();
+    let code = auth.store().pending_get("wrong-code").unwrap().unwrap().code;
+
+    assert!(!code.is_empty());
+    assert_eq!(refusal(auth.approve_with_code("wrong-code", "WRONG123", Some(&nonce))), "Invalid code");
+    assert_eq!(
+        auth.approve_with_code("wrong-code", &code, Some(&nonce)).unwrap().redirect_uri,
+        "https://claude.ai/callback"
+    );
+}
+
+#[test]
+fn an_expired_pending_code_is_refused() {
+    let path = std::env::temp_dir().join(format!("porchlight-expired-code-{}", random_token(8)));
+    let store = Store::open(&path).unwrap();
+    let auth = Auth::new(store.clone());
+    let nonce = begin(&auth, "expired-code").unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute("UPDATE pending SET expires_at = ? WHERE id = ?", rusqlite::params![now_ms() - 1, "expired-code"])
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(refusal(auth.approve_with_code("expired-code", "ANYCODE", Some(&nonce))), "Code expired");
+
+    drop(auth);
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+#[test]
+fn an_approval_code_still_works_after_four_wrong_attempts() {
     assert_eq!(guess_then_enter(&auth(), "typo", 4).unwrap(), "https://claude.ai/callback");
 }
 
 #[test]
-fn a_device_code_locks_after_five_wrong_attempts() {
-    assert_eq!(refusal(guess_then_enter(&auth(), "guess", 5)), "Too many attempts");
+fn an_approval_code_locks_after_five_wrong_attempts() {
+    assert_eq!(refusal(guess_then_enter(&auth(), "guess", 5)), "Code expired");
 }
 
 #[test]
 fn removing_a_server_invalidates_its_approved_authorization_codes() {
     let auth = auth();
     let nonce = begin(&auth, "remove-before-exchange").unwrap();
-    let ticket = auth.issue_ticket("remove-before-exchange");
-    let approval = auth.approve_with_ticket("remove-before-exchange", &ticket, Some(&nonce)).unwrap();
+    let code = auth.store().pending_get("remove-before-exchange").unwrap().unwrap().code;
+    let approval = auth.approve_with_code("remove-before-exchange", &code, Some(&nonce)).unwrap();
     auth.revoke_server("paper").unwrap();
 
-    assert_eq!(refusal(auth.exchange_code(&approval.code, "verifier", "")), "invalid_grant");
+    assert_eq!(
+        refusal(auth.exchange_code(
+            &approval.code,
+            "verifier-012345678901234567890123456789012345",
+            "",
+            "claude",
+            "https://claude.ai/callback",
+        )),
+        "invalid_grant"
+    );
 }
 
 #[test]
@@ -86,18 +133,144 @@ fn revoking_a_grant_aborts_streams_using_that_grant() {
 fn revoking_an_access_token_also_ends_its_refresh_token_and_streams() {
     let auth = auth();
     let nonce = begin(&auth, "revoke-family").unwrap();
-    let ticket = auth.issue_ticket("revoke-family");
-    let approval = auth.approve_with_ticket("revoke-family", &ticket, Some(&nonce)).unwrap();
-    let pair = auth.exchange_code(&approval.code, "verifier", "").unwrap();
+    let code = auth.store().pending_get("revoke-family").unwrap().unwrap().code;
+    let approval = auth.approve_with_code("revoke-family", &code, Some(&nonce)).unwrap();
+    let pair = auth
+        .exchange_code(
+            &approval.code,
+            "verifier-012345678901234567890123456789012345",
+            "",
+            "claude",
+            "https://claude.ai/callback",
+        )
+        .unwrap();
     let grant = auth.authorize(&pair.access, "paper").unwrap().unwrap();
     let stream = auth.open_grant_stream(&grant);
     auth.revoke(&pair.access).unwrap();
 
     assert_eq!(auth.authorize(&pair.access, "paper").unwrap(), None);
-    assert_eq!(refusal(auth.refresh(&pair.refresh)), "Refresh token reused; grant revoked");
+    assert_eq!(refusal(auth.refresh(&pair.refresh)), "invalid_grant");
     assert!(stream.token.is_cancelled());
 }
 
+#[test]
+fn two_correct_code_submissions_mint_at_most_one_authorization_code() {
+    let auth = auth();
+    let nonce = begin(&auth, "parallel-code").unwrap();
+    let code = auth.store().pending_get("parallel-code").unwrap().unwrap().code;
+    let first = auth.clone();
+    let second = auth.clone();
+
+    let results = std::thread::scope(|scope| {
+        let first = scope.spawn(|| first.approve_with_code("parallel-code", &code, Some(&nonce)).is_ok());
+        let second = scope.spawn(|| second.approve_with_code("parallel-code", &code, Some(&nonce)).is_ok());
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+
+    assert_eq!(results.into_iter().filter(|approved| *approved).count(), 1);
+}
+
+#[test]
+fn refresh_token_reuse_revokes_grant_and_closes_its_streams() {
+    let auth = auth();
+    let nonce = begin(&auth, "refresh-reuse").unwrap();
+    let code = auth.store().pending_get("refresh-reuse").unwrap().unwrap().code;
+    let approval = auth.approve_with_code("refresh-reuse", &code, Some(&nonce)).unwrap();
+    let pair = auth
+        .exchange_code(
+            &approval.code,
+            "verifier-012345678901234567890123456789012345",
+            "",
+            "claude",
+            "https://claude.ai/callback",
+        )
+        .unwrap();
+    let grant = auth.authorize(&pair.access, "paper").unwrap().unwrap();
+    let stream = auth.open_grant_stream(&grant);
+    let rotated = auth.refresh(&pair.refresh).unwrap();
+
+    assert_eq!(refusal(auth.refresh(&pair.refresh)), "Refresh token reused; grant revoked");
+    assert_eq!(auth.authorize(&rotated.access, "paper").unwrap(), None);
+    assert!(stream.token.is_cancelled());
+}
+
+#[test]
+fn registration_limit_is_per_source_and_global() {
+    let auth = auth();
+
+    for _ in 0..5 {
+        assert!(auth.allow_registration("source-a").unwrap());
+    }
+
+    assert!(!auth.allow_registration("source-a").unwrap());
+    assert!(auth.allow_registration("source-b").unwrap());
+}
+
+#[test]
+fn link_membership_signatures_distinguish_comma_containing_names() {
+    use porchlight::links::LinkPlan;
+
+    let combined =
+        LinkPlan::Commands { name: "shared".to_owned(), apps: Vec::new(), membership: vec!["a,b".to_owned()] };
+    let separate = LinkPlan::Commands {
+        name: "shared".to_owned(),
+        apps: Vec::new(),
+        membership: vec!["a".to_owned(), "b".to_owned()],
+    };
+
+    assert_ne!(combined.signature(), separate.signature());
+}
+
+#[test]
+fn authorization_codes_require_the_request_client_and_redirect_uri() {
+    let auth = auth();
+    let nonce = begin(&auth, "wrong-client").unwrap();
+    let code = auth.store().pending_get("wrong-client").unwrap().unwrap().code;
+    let approval = auth.approve_with_code("wrong-client", &code, Some(&nonce)).unwrap();
+
+    assert_eq!(
+        refusal(auth.exchange_code(
+            &approval.code,
+            "verifier-012345678901234567890123456789012345",
+            "",
+            "other-client",
+            "https://claude.ai/callback",
+        )),
+        "invalid_grant"
+    );
+}
+
+#[test]
+fn authorization_code_rejects_invalid_pkce_verifier_syntax() {
+    let auth = auth();
+    let nonce = begin(&auth, "invalid-verifier").unwrap();
+    let code = auth.store().pending_get("invalid-verifier").unwrap().unwrap().code;
+    let approval = auth.approve_with_code("invalid-verifier", &code, Some(&nonce)).unwrap();
+
+    assert_eq!(
+        refusal(auth.exchange_code(&approval.code, "short", "", "claude", "https://claude.ai/callback")),
+        "Invalid PKCE verifier"
+    );
+}
+
+#[test]
+fn authorization_codes_require_the_original_redirect_uri() {
+    let auth = auth();
+    let nonce = begin(&auth, "wrong-redirect").unwrap();
+    let code = auth.store().pending_get("wrong-redirect").unwrap().unwrap().code;
+    let approval = auth.approve_with_code("wrong-redirect", &code, Some(&nonce)).unwrap();
+
+    assert_eq!(
+        refusal(auth.exchange_code(
+            &approval.code,
+            "verifier-012345678901234567890123456789012345",
+            "",
+            "claude",
+            "https://attacker.example/callback",
+        )),
+        "invalid_grant"
+    );
+}
 #[test]
 fn pending_connection_requests_are_capped() {
     let auth = auth();
@@ -221,9 +394,9 @@ fn named_links_overlap_and_the_wildcard_selects_every_command_app() {
     assert_eq!(
         plans,
         [
-            ("home".to_owned(), "commands:lamp".to_owned()),
-            ("work".to_owned(), "commands:lamp,notes".to_owned()),
-            ("everything".to_owned(), "commands:lamp,notes".to_owned()),
+            ("home".to_owned(), "commands:4:lamp".to_owned()),
+            ("work".to_owned(), "commands:4:lamp5:notes".to_owned()),
+            ("everything".to_owned(), "commands:4:lamp5:notes".to_owned()),
         ]
     );
 }
@@ -326,6 +499,138 @@ fn awk_with_client_input_is_treated_as_code_execution() {
 }
 
 #[test]
+fn wrappers_and_client_chosen_applets_are_treated_as_code_execution() {
+    let words = |run: &str| template_words(&run.split(' ').map(str::to_owned).collect::<Vec<_>>());
+
+    for run in [
+        "nohup sh -c {script}",
+        "setsid {program}",
+        "stdbuf -oL bash -c {script}",
+        "busybox {applet} -c {script}",
+        "busybox sh -c {script}",
+        "toybox nohup sh -c {script}",
+    ] {
+        assert!(runs_client_code(&words(run)), "{run}");
+    }
+
+    assert!(!runs_client_code(&words("busybox ls {dir}")));
+}
+
+#[test]
+fn risk_follows_from_what_a_client_controls_not_from_the_program_name() {
+    let words = |run: &str| template_words(&run.split(' ').map(str::to_owned).collect::<Vec<_>>());
+    let open = IndexMap::new();
+    let limited: IndexMap<String, Input> =
+        [("room".to_owned(), serde_json::from_value(json!({ "choices": ["kitchen"] })).unwrap())].into();
+    let level =
+        |run: &str, inputs: &IndexMap<String, Input>, read_only: bool| assess(&words(run), inputs, read_only).level();
+
+    assert_eq!(level("date +%F", &open, true), Level::Reads);
+    assert_eq!(level("cat {name}", &open, true), Level::Reads);
+    assert_eq!(level("date", &open, false), Level::Changes);
+    assert_eq!(level("lights {room}", &limited, false), Level::Changes);
+    assert_eq!(level("./cleanup.sh {path}", &open, false), Level::ClientChooses);
+    assert_eq!(level("curl -X DELETE https://api.example.com/{id}", &open, false), Level::ClientChooses);
+    assert_eq!(level("rm -rf {path}", &open, true), Level::ClientChooses);
+    assert_eq!(level("sh -c {script}", &open, false), Level::RunsCode);
+}
+
+#[test]
+fn an_mcp_tool_is_only_read_only_when_nothing_it_announces_says_otherwise() {
+    let level = |tool: Value| porchlight::sources::announced_risk(&serde_json::from_value(tool).unwrap()).level();
+    let text = json!({ "properties": { "title": { "type": "string" } } });
+    let picked = json!({ "properties": { "state": { "type": "string", "enum": ["open", "closed"] } } });
+
+    assert_eq!(level(json!({ "name": "list", "annotations": { "readOnlyHint": true } })), Level::Reads);
+    assert_eq!(
+        level(json!({ "name": "purge", "annotations": { "readOnlyHint": true, "destructiveHint": true } })),
+        Level::Changes
+    );
+    assert_eq!(level(json!({ "name": "sync" })), Level::Changes);
+    assert_eq!(level(json!({ "name": "close", "inputSchema": picked })), Level::Changes);
+    assert_eq!(level(json!({ "name": "create_issue", "inputSchema": text })), Level::ClientChooses);
+    assert_eq!(level(json!({ "name": "run_command", "annotations": { "readOnlyHint": true } })), Level::RunsCode);
+}
+
+#[test]
+fn a_known_destructive_program_contradicts_a_read_only_claim_even_behind_a_wrapper() {
+    let words = |run: &str| template_words(&run.split(' ').map(str::to_owned).collect::<Vec<_>>());
+
+    for run in [
+        "rm -rf {path}",
+        "timeout 5 rm {path}",
+        "nice -n 5 shred {file}",
+        "find {dir} -delete",
+        "git push --force origin {branch}",
+        "docker rm {container}",
+        "mkfs.ext4 {disk}",
+    ] {
+        assert!(assess(&words(run), &IndexMap::new(), true).contradiction().is_some(), "{run}");
+    }
+
+    for run in ["ls {dir}", "git status", "docker ps", "find {dir} -name {pattern}"] {
+        assert!(assess(&words(run), &IndexMap::new(), true).contradiction().is_none(), "{run}");
+    }
+}
+
+#[test]
+fn a_destructive_command_is_never_announced_as_read_only() {
+    let compiled = compile(&json!({ "t": { "run": "rm -rf /tmp/box/{name}", "readOnly": true } }));
+    let tools = &compiled.specs[0].source.contribution().unwrap().tools;
+    let annotations = command_tools(tools)[0].annotations.clone().unwrap();
+
+    assert_eq!(annotations.read_only_hint, Some(false));
+    assert_eq!(annotations.destructive_hint, Some(true));
+}
+
+#[test]
+fn a_resource_cant_be_a_destructive_command() {
+    let compiled = compile(&json!({ "t": { "run": "rm -rf /tmp/box", "resource": true } }));
+
+    assert!(compiled.specs.is_empty());
+    assert!(compiled.problems.iter().any(|problem| problem.message.contains("deletes files")));
+}
+
+#[tokio::test]
+async fn no_input_can_climb_out_of_a_folder() {
+    let changes = json!({ "run": "printf \"[%s]\" /tmp/box/{name}" });
+    let reads = json!({ "run": "printf \"[%s]\" /tmp/box/{name}", "readOnly": true });
+
+    assert!(call_command(changes.clone(), json!({ "name": "../etc" })).await.contains("can't contain .."));
+    assert!(call_command(reads, json!({ "name": "notes/../../.ssh" })).await.contains("can't contain .."));
+    assert_eq!(call_command(changes, json!({ "name": "a..b" })).await, "[/tmp/box/a..b]");
+}
+
+fn add_from_a_script(args: &[&str]) -> (Option<i32>, String) {
+    let home = std::env::temp_dir().join(format!("porchlight-add-{}", random_token(6)));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_porchlight"))
+        .args(["tools", "add"])
+        .args(args)
+        .env("PORCHLIGHT_HOME", &home)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let saved = std::fs::read_to_string(home.join("porchlight.json")).unwrap_or_default();
+    std::fs::remove_dir_all(&home).ok();
+
+    (output.status.code(), saved)
+}
+
+#[test]
+fn a_script_cant_add_a_tool_that_changes_things_with_input_a_client_chooses() {
+    let (code, saved) = add_from_a_script(&["stamp", "--", "touch", "{name}"]);
+    assert_eq!(code, Some(5));
+    assert!(!saved.contains("stamp"));
+
+    let (code, saved) = add_from_a_script(&["say", "--read-only", "--", "echo", "{text}"]);
+    assert_eq!(code, Some(0));
+    assert!(saved.contains("say"));
+
+    let (code, _) = add_from_a_script(&["wipe", "--read-only", "--", "rm", "-rf", "{path}"]);
+    assert_eq!(code, Some(2));
+}
+
+#[test]
 fn quoted_assignments_stay_one_argument_when_compiling_a_command_string() {
     let compiled = compile(&json!({ "message": "printf \"[%s]\" --message=\"hello world\"" }));
     let tool = &compiled.specs[0].source.contribution().unwrap().tools["message"];
@@ -416,4 +721,75 @@ fn a_forwarded_address_is_recorded_as_a_claim_not_a_fact() {
         source_of(&headers(&[("host", "porchlight.x.opentunnel.xyz"), ("x-forwarded-for", "6.6.6.6")])),
         "the tunnel, says 6.6.6.6"
     );
+}
+
+#[test]
+fn concurrent_first_opens_leave_a_complete_sqlite_schema() {
+    let path = std::env::temp_dir().join(format!("porchlight-concurrent-schema-{}", random_token(8)));
+
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let path = path.clone();
+            scope.spawn(move || Store::open(&path).unwrap());
+        }
+    });
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.pending_count_active(now_ms()).unwrap(), 0);
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn upgrading_the_database_preserves_access_and_history_but_ends_old_pending_requests() {
+    let path = std::env::temp_dir().join(format!("porchlight-upgrade-{}", random_token(8)));
+    let old_schema = include_str!("fixtures/schema-v2.sql");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch(old_schema).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO clients VALUES ('client', '[]', 'Existing client', 1);
+        INSERT INTO grants VALUES ('grant', 'client', 'tools', 1, NULL);
+        INSERT INTO tokens VALUES ('token-hash', 'static', 'grant', 'tools', 9999999999999, 0);
+        INSERT INTO audit (at, event) VALUES (1, 'before-upgrade');
+        INSERT INTO pending (id, client_id, server, redirect_uri, challenge, nonce_hash, created_at, expires_at)
+            VALUES ('old-request', 'client', 'tools', 'https://example.com', 'challenge', 'nonce', 1, 2);",
+        )
+        .unwrap();
+    drop(connection);
+    let store = Store::open(&path).unwrap();
+    assert!(store.grant_exists("grant").unwrap());
+    assert!(store.token_get("token-hash").unwrap().is_some());
+    assert_eq!(store.client_name("client").unwrap(), "Existing client");
+    assert!(store.pending_list().unwrap().is_empty());
+    drop(store);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM audit WHERE event = 'before-upgrade'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+    drop(connection);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn opening_a_newer_database_refuses_without_deleting_its_data() {
+    let path = std::env::temp_dir().join(format!("porchlight-newer-schema-{}", random_token(8)));
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA user_version = 99; CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('keep');",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(Store::open(&path).is_err());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        connection.query_row("SELECT value FROM future_data", [], |row| row.get::<_, String>(0)).unwrap(),
+        "keep"
+    );
+    assert_eq!(connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 99);
+    drop(connection);
+    std::fs::remove_file(path).unwrap();
 }

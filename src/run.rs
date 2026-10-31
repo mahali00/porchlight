@@ -1,8 +1,9 @@
 use crate::config::Config;
-use crate::control::{self, DaemonState, daemon_state, socket_path};
+use crate::control::{self, daemon_state, socket_path};
 use crate::core::is_https_url;
 use crate::daemon::{self, Options};
 use crate::exit::{ExitCode, ExitError};
+use crate::state::DaemonState;
 use crate::store::{PortKey, Ports, Store};
 use crate::system;
 use crate::tunnels::{DEFAULT_TUNNEL, Provider};
@@ -25,17 +26,17 @@ pub fn resolve_tunnel(config: &Config) -> Result<String, ExitError> {
     Ok(DEFAULT_TUNNEL.to_owned())
 }
 
-pub async fn ensure_tunnel(choice: &str, quiet: bool) -> Result<(), ExitError> {
+pub async fn ensure_tunnel(choice: &str) -> Result<(), ExitError> {
     let Some(provider) = Provider::named(choice) else {
         return Ok(());
     };
 
-    if provider.installed().await || provider.install(quiet).await {
+    if provider.installed().await || provider.install().await {
         return Ok(());
     }
 
     Err(ExitError::new(ExitCode::TunnelFailed, format!("{} isn't installed", provider.label()))
-        .next("Install it with `npm i -g opentunnel`, or use your own tunnel's https:// address."))
+        .next("Install OpenTunnel 0.5.0 with `npm i -g opentunnel@0.5.0`, or use your own tunnel's https:// address."))
 }
 
 async fn port_is_free(port: u16) -> bool {
@@ -86,7 +87,7 @@ fn servers_json(state: &DaemonState, status: &str) -> Value {
             "tools": server.tools,
         })).collect::<Vec<_>>(),
         "status": status,
-        "next_action": "Give share the url so they add it as a remote MCP server in their MCP client and approve the connection on this computer. You cannot approve on their behalf.",
+        "next_action": "Add a link's url as a remote MCP server in the MCP client. A person at this computer must approve the connection; you can't approve it.",
     })
 }
 
@@ -115,7 +116,6 @@ pub async fn serve() -> Result<(), ExitError> {
     let config = Config::default_location();
     let store = Store::open_default().map_err(|error| internal(&error))?;
     let tunnel = resolve_tunnel(&config)?;
-    ensure_tunnel(&tunnel, true).await?;
     let fixed = config.load().map_err(|error| internal(&error))?.settings.port;
     let ports = choose_ports(&store, fixed, is_https_url(&tunnel)).await?;
     let options =
@@ -135,7 +135,7 @@ pub async fn serve() -> Result<(), ExitError> {
 }
 
 pub fn tunnel_trouble() -> Option<String> {
-    let log = std::fs::read_to_string(crate::config::log_dir().join("opentunnel.log")).ok()?;
+    let log = std::fs::read_to_string(crate::core::log_dir().join("opentunnel.log")).ok()?;
     let recent: Vec<&str> = log.lines().rev().take(80).collect();
     let error = recent.iter().find(|line| line.trim_start().starts_with("error:"))?;
 
@@ -152,10 +152,10 @@ pub async fn start(say: &(dyn Fn(&str) + Sync)) -> Result<(DaemonState, bool), E
     let tunnel = resolve_tunnel(&config)?;
 
     if Provider::named(&tunnel).is_some() {
-        say("Installing OpenTunnel if it's missing");
+        say("Installing OpenTunnel 0.5.0 if it's missing");
     }
 
-    ensure_tunnel(&tunnel, true).await?;
+    ensure_tunnel(&tunnel).await?;
     say("Starting in the background");
     let installed = system::service_supported() && system::install_service(&["serve"]).await.is_ok();
 
@@ -195,7 +195,7 @@ pub async fn status(json_output: bool) -> Result<(), ExitError> {
                 json!({ "ok": true, "running": false, "service": { "installed": service.installed, "running": service.running } })
             );
         } else {
-            out!("○ porchlight isn't running. Start it with porchlight");
+            out!("○ porchlight isn't running");
         }
 
         return Ok(());

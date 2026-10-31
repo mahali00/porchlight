@@ -1,4 +1,4 @@
-use crate::config::log_dir;
+use crate::core::log_dir;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -56,6 +56,7 @@ fn home() -> PathBuf {
 
 struct ServiceEnvironment {
     search_path: String,
+    porchlight_home: Option<String>,
     out_log: String,
     err_log: String,
 }
@@ -63,6 +64,7 @@ struct ServiceEnvironment {
 fn service_environment() -> ServiceEnvironment {
     ServiceEnvironment {
         search_path: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned()),
+        porchlight_home: std::env::var("PORCHLIGHT_HOME").ok(),
         out_log: log_dir().join("service.out.log").display().to_string(),
         err_log: log_dir().join("service.err.log").display().to_string(),
     }
@@ -86,9 +88,18 @@ fn quote_systemd(arg: &str) -> String {
     format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%").replace('$', "$$"))
 }
 
+fn systemd_path(path: &str) -> String {
+    path.replace('%', "%%")
+}
+
 fn plist(command: &[String], environment: &ServiceEnvironment) -> String {
     let arguments: Vec<String> =
         command.iter().map(|arg| format!("    <string>{}</string>", escape_xml(arg))).collect();
+    let porchlight_home = environment
+        .porchlight_home
+        .as_ref()
+        .map(|home| format!("    <key>PORCHLIGHT_HOME</key><string>{}</string>\n", escape_xml(home)))
+        .unwrap_or_default();
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -105,7 +116,7 @@ fn plist(command: &[String], environment: &ServiceEnvironment) -> String {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>{}</string>
-  </dict>
+{}{}</dict>
   <key>StandardOutPath</key><string>{}</string>
   <key>StandardErrorPath</key><string>{}</string>
 </dict>
@@ -113,6 +124,8 @@ fn plist(command: &[String], environment: &ServiceEnvironment) -> String {
 "#,
         arguments.join("\n"),
         escape_xml(&environment.search_path),
+        porchlight_home,
+        "",
         escape_xml(&environment.out_log),
         escape_xml(&environment.err_log)
     )
@@ -120,13 +133,18 @@ fn plist(command: &[String], environment: &ServiceEnvironment) -> String {
 
 fn unit(command: &[String], environment: &ServiceEnvironment) -> String {
     let exec: Vec<String> = command.iter().map(|arg| quote_systemd(arg)).collect();
+    let envs = std::iter::once(format!("PATH={}", environment.search_path))
+        .chain(environment.porchlight_home.as_ref().map(|home| format!("PORCHLIGHT_HOME={home}")))
+        .map(|env| quote_systemd(&env))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     format!(
         "[Unit]\nDescription=porchlight\nAfter=network-online.target\n\n[Service]\nExecStart={}\nRestart=always\nRestartSec=5\nEnvironment={}\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
         exec.join(" "),
-        quote_systemd(&format!("PATH={}", environment.search_path)),
-        environment.out_log,
-        environment.err_log
+        envs,
+        systemd_path(&environment.out_log),
+        systemd_path(&environment.err_log)
     )
 }
 

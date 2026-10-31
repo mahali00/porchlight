@@ -1,16 +1,15 @@
 use crate::apps::{apps_from, host_environment};
 use crate::auth::Auth;
 use crate::config::{Config, Settings};
-use crate::core::{Problem, link_path, now_ms};
+use crate::core::{Problem, now_ms};
 use crate::crypto::sha256;
-use crate::links::{LinkEntry, ServerState, signatures_of};
+use crate::links::signatures_of;
 use crate::registry::Registry;
 use crate::store::Store;
 use crate::system;
 use crate::tunnels::{Opened, Provider, TunnelChoice, TunnelError, tunnel_choice};
 use futures::future::BoxFuture;
 use indexmap::{IndexMap, IndexSet};
-use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -103,72 +102,6 @@ impl Daemon {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ServerView {
-    pub name: String,
-    pub url: String,
-    pub state: ServerState,
-    pub detail: String,
-    pub tools: usize,
-    pub names: Vec<String>,
-    #[serde(default)]
-    pub catalog: Vec<ToolInfo>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolInfo {
-    pub name: String,
-    pub app: String,
-    pub tool: String,
-    pub about: Option<String>,
-    pub read_only: Option<bool>,
-    pub resource: bool,
-    pub dangerous: bool,
-    pub on: bool,
-    #[serde(default)]
-    pub inputs: Vec<String>,
-}
-
-pub fn view_of(entry: &LinkEntry, public_url: &str) -> ServerView {
-    let mut names: Vec<String> = entry.allowed.iter().cloned().collect();
-    names.sort();
-    let catalog = entry
-        .tools
-        .iter()
-        .map(|tool| {
-            let origin = entry.origins.get(&tool.name);
-            ToolInfo {
-                name: tool.name.clone(),
-                app: origin.map_or_else(|| entry.name.clone(), |origin| origin.app.clone()),
-                tool: origin.map_or_else(|| tool.name.clone(), |origin| origin.tool.clone()),
-                about: tool.description.clone(),
-                read_only: tool.annotations.as_ref().and_then(|annotations| annotations.read_only_hint),
-                resource: entry.resources.values().any(|exposed| *exposed == tool.name),
-                dangerous: entry.source_app.is_some() && crate::policy::is_dangerous(tool),
-                on: entry.allowed.contains(&tool.name),
-                inputs: tool
-                    .input_schema
-                    .as_ref()
-                    .and_then(|schema| schema.get("properties"))
-                    .and_then(serde_json::Value::as_object)
-                    .map(|properties| properties.keys().cloned().collect())
-                    .unwrap_or_default(),
-            }
-        })
-        .collect();
-
-    ServerView {
-        name: entry.name.clone(),
-        url: format!("{public_url}{}", link_path(&entry.name)),
-        state: entry.state,
-        detail: entry.detail.clone(),
-        tools: entry.allowed.len(),
-        names,
-        catalog,
-    }
-}
-
 fn apps_of(settings: &Settings) -> IndexMap<String, String> {
     settings
         .mcp
@@ -198,7 +131,22 @@ pub fn describe_changes(before: &Settings, after: &Settings) -> Vec<String> {
             (_, Some(true)) => Some(format!("{pattern} on")),
             (_, Some(false)) => Some(format!("{pattern} off")),
         });
-    let links = (before.links != after.links).then(|| "links changed".to_owned());
+    let names: IndexSet<&String> = before.links.keys().chain(after.links.keys()).collect();
+    let links = names.into_iter().filter_map(|name| match (before.links.get(name), after.links.get(name)) {
+        (was, is) if was == is => None,
+        (None, _) => Some(format!("link {name} added")),
+        (_, None) => Some(format!("link {name} removed")),
+        (Some(was), Some(is)) => {
+            let added = is.apps().iter().filter(|app| !was.apps().contains(app)).map(|app| format!("+{app}"));
+            let removed = was.apps().iter().filter(|app| !is.apps().contains(app)).map(|app| format!("-{app}"));
+            let moved: Vec<String> = added.chain(removed).collect();
+            Some(if moved.is_empty() {
+                format!("link {name} changed")
+            } else {
+                format!("link {name} {}", moved.join(" "))
+            })
+        }
+    });
 
     apps.chain(rules).chain(links).collect()
 }
@@ -259,7 +207,7 @@ impl Reloader {
     async fn apply(&self) -> Result<(), String> {
         let loaded = self.config.load().map_err(|error| error.message)?;
         let apps = apps_from(&loaded.settings, &host_environment(), Some(&loaded.commands));
-        let previous = self.applied.lock().ok().and_then(|mut applied| applied.replace(loaded.settings.clone()));
+        let previous = self.applied.lock().ok().and_then(|applied| applied.clone());
         let failed = |error: &dyn std::fmt::Display| error.to_string();
         let granted: IndexSet<String> =
             self.store.grants_list().map_err(|error| failed(&error))?.into_iter().map(|grant| grant.server).collect();
@@ -285,18 +233,30 @@ impl Reloader {
             compiled.iter().filter(|(server, signature)| old.get(*server) != Some(signature)).map(|(server, _)| server);
         let revoke: IndexSet<&String> = removed_links.chain(new_membership).collect();
 
+        let mut revoke_failed = false;
+
         for server in revoke {
-            self.auth.revoke_server(server).map_err(|error| failed(&error))?;
+            if let Err(error) = self.auth.revoke_server(server) {
+                eprintln!("Couldn't revoke access for {server}: {error}");
+                revoke_failed = true;
+            }
         }
 
+        if revoke_failed {
+            return Err("Couldn't remove access for one or more links".to_owned());
+        }
         let signatures = serde_json::to_string(&next).unwrap_or_else(|_| "{}".to_owned());
         self.store.meta_set("link-signatures", &signatures).map_err(|error| failed(&error))?;
         self.registry.set_rules(apps.rules).await;
         self.registry.sync(apps.specs, apps.links).await;
-        let changes = previous.map(|previous| describe_changes(&previous, &loaded.settings)).unwrap_or_default();
+        let changes =
+            previous.as_ref().map(|previous| describe_changes(previous, &loaded.settings)).unwrap_or_default();
 
         if !changes.is_empty() {
             let _ = self.store.audit_write("config.changed", &changes.join("; "));
+        }
+        if let Ok(mut applied) = self.applied.lock() {
+            *applied = Some(loaded.settings.clone());
         }
 
         self.set_problems(loaded.problems.into_iter().chain(apps.problems).collect());
@@ -307,15 +267,16 @@ impl Reloader {
     async fn reload_with(&self, current: String) {
         let _locked = self.lock.lock().await;
 
-        if let Ok(mut seen) = self.seen.lock() {
-            *seen = current;
-        }
-
         if let Err(message) = self.apply().await {
             self.set_problems(vec![Problem {
                 app: String::new(),
                 message: format!("{message}. Still using the last good settings."),
             }]);
+            return;
+        }
+
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen = current;
         }
     }
 
@@ -377,4 +338,36 @@ pub fn upkeep(store: Store, daemon: Arc<Daemon>) -> tokio::task::JoinHandle<()> 
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Reloader;
+    use crate::auth::Auth;
+    use crate::config::Config;
+    use crate::registry::Registry;
+    use crate::store::Store;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn a_failed_apply_does_not_mark_the_config_fingerprint_as_seen() {
+        let path = std::env::temp_dir().join(format!("porchlight-reload-{}.json", crate::crypto::random_token(6)));
+        std::fs::write(&path, "{").unwrap();
+        let store = Store::in_memory().unwrap();
+        let reloader = Reloader {
+            registry: Registry::new(store.clone(), "test-host".to_owned()),
+            config: Config::at(path.clone()),
+            store: store.clone(),
+            auth: Auth::new(store),
+            applied: Mutex::new(None),
+            problems: Mutex::new(Vec::new()),
+            seen: Mutex::new(String::new()),
+            lock: tokio::sync::Mutex::new(()),
+        };
+
+        reloader.reload_with("bad-config-fingerprint".to_owned()).await;
+
+        assert!(reloader.seen.lock().unwrap().is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
 }

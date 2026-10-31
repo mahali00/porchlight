@@ -1,8 +1,9 @@
-use crate::apps::{Environment, apps_from, host_environment, slugify, template_words};
-use crate::config::{CommandApp, Config, ConfigError, Settings, decode_command};
+use crate::apps::{Environment, apps_from, host_environment};
+use crate::config::{CommandApp, Config, ConfigError, Settings};
 use crate::control::reload_daemon;
-use crate::core::{is_app_name, link_path};
-use crate::sources::commands::{inputs_of, run_tool, runs_client_code};
+use crate::core::{is_app_name, link_path, slugify};
+use crate::sources::commands::run_tool;
+use crate::spec::CommandSpec;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
@@ -97,16 +98,37 @@ pub fn split_tool(config: &Config, settings: &Settings, app: &str, tool: &str) -
     let Some(CommandApp::Group(group)) = settings.commands.get(app) else {
         return Err(ConfigError { message: format!("{app} has only one tool") });
     };
-    let Some(member) = group.members.get(tool) else {
-        return Err(ConfigError { message: format!("{app} has no tool called {tool}") });
+    let mut standalone = match group.members.get(tool) {
+        Some(Value::String(run)) => Map::from_iter([("run".to_owned(), json!(run))]),
+        Some(Value::Object(member)) if member.contains_key("run") => member.clone(),
+        _ => return Err(ConfigError { message: format!("{app} has no tool called {tool}") }),
     };
+    let mut environment: Map<String, Value> =
+        group.environment.iter().flatten().map(|(key, value)| (key.clone(), json!(value))).collect();
+
+    if let Some(Value::Object(own)) = standalone.get("environment") {
+        environment.extend(own.clone());
+    }
+
+    if !environment.is_empty() {
+        standalone.insert("environment".to_owned(), Value::Object(environment));
+    }
+
+    if let Some(cwd) = &group.cwd {
+        standalone.entry("cwd").or_insert_with(|| json!(cwd));
+    }
+
+    if let Some(allow) = group.allow_dangerous {
+        standalone.entry("allowDangerous").or_insert_with(|| json!(allow));
+    }
+
     let base = slugify(&format!("{app}-{tool}"));
     let name = (1..1000)
         .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
         .find(|name| !settings.commands.contains_key(name) && !settings.mcp.contains_key(name))
         .unwrap_or(base);
 
-    config.edit(&["commands", &name], Some(member))?;
+    config.edit(&["commands", &name], Some(&Value::Object(standalone)))?;
     config.edit(&["commands", app, tool], None)?;
     let links: Vec<String> = settings
         .links
@@ -129,70 +151,6 @@ pub fn set_tunnel(config: &Config, tunnel: &str) -> Result<(), ConfigError> {
     config.edit(&["tunnel"], Some(&json!(tunnel)))
 }
 
-pub fn run_value(words: &[String]) -> Value {
-    if words.iter().all(|word| !word.is_empty() && !word.contains(|c: char| c.is_whitespace() || c == '"' || c == '\''))
-    {
-        json!(words.join(" "))
-    } else {
-        json!(words)
-    }
-}
-
-pub struct CommandDraft {
-    pub words: Vec<String>,
-    pub app: String,
-    pub description: Option<String>,
-    pub read_only: bool,
-    pub allow_dangerous: bool,
-}
-
-impl CommandDraft {
-    pub fn program(&self) -> String {
-        self.words.first().cloned().unwrap_or_default()
-    }
-
-    pub fn shown(&self) -> String {
-        self.words.join(" ")
-    }
-
-    pub fn takes_inputs(&self) -> bool {
-        !inputs_of(&template_words(&self.words)).is_empty()
-    }
-
-    pub fn runs_client_code(&self) -> bool {
-        runs_client_code(&template_words(&self.words))
-    }
-
-    pub fn default_name(&self) -> String {
-        slugify(Path::new(&self.program()).file_name().and_then(|name| name.to_str()).unwrap_or("tool"))
-    }
-
-    fn settings(&self) -> Value {
-        let run = run_value(&self.words);
-
-        if run.is_string() && self.description.is_none() && !self.read_only && !self.allow_dangerous {
-            return run;
-        }
-
-        let mut object = Map::new();
-        object.insert("run".into(), run);
-
-        if let Some(description) = &self.description {
-            object.insert("description".into(), json!(description));
-        }
-
-        if self.read_only {
-            object.insert("readOnly".into(), json!(true));
-        }
-
-        if self.allow_dangerous {
-            object.insert("allowDangerous".into(), json!(true));
-        }
-
-        Value::Object(object)
-    }
-}
-
 pub fn program_problem(program: &str) -> Option<String> {
     if program.is_empty() {
         return Some("Type the command to run".to_owned());
@@ -211,8 +169,8 @@ pub fn name_problem(name: &str, settings: &Settings) -> Option<String> {
         .then(|| format!("{name} already exists. Pick another name"))
 }
 
-pub fn write_command(config: &Config, draft: &CommandDraft) -> Result<(), ConfigError> {
-    config.edit(&["commands", &draft.app], Some(&draft.settings()))
+pub fn write_command(config: &Config, spec: &CommandSpec) -> Result<(), ConfigError> {
+    config.edit(&["commands", &spec.app], Some(&spec.to_value()))
 }
 
 pub fn add_mcp(config: &Config, name: &str, server: &Value) -> Result<(), ConfigError> {
@@ -241,6 +199,12 @@ pub fn server_name(command: &[String]) -> String {
     slugify(if trimmed.is_empty() { &base } else { trimmed })
 }
 
+pub fn import_name(server: &crate::discovery::DiscoveredServer, settings: &crate::config::Settings) -> String {
+    let taken = |name: &str| settings.mcp.contains_key(name) || settings.commands.contains_key(name);
+    let name = if is_app_name(&server.name) { server.name.clone() } else { crate::core::slugify(&server.name) };
+    if taken(&name) { format!("{name}-{}", crate::core::slugify(&server.source)) } else { name }
+}
+
 pub struct Tried {
     pub ok: bool,
     pub text: String,
@@ -267,38 +231,26 @@ pub async fn try_tool(settings: &Settings, environment: &Environment, app: &str,
     Tried { ok: !run.is_error, text: run.text }
 }
 
-pub async fn try_draft(draft: &CommandDraft) -> Tried {
+pub async fn try_draft(spec: &CommandSpec) -> Tried {
     let mut settings = Settings::default();
 
-    match crate::config::decode_command_app(&draft.settings()) {
+    match crate::config::decode_command_app(&spec.to_value()) {
         Ok(command) => {
-            settings.commands.insert(draft.app.clone(), command);
-            try_tool(&settings, &host_environment(), &draft.app, &draft.app, &json!({})).await
+            settings.commands.insert(spec.app.clone(), command);
+            try_tool(&settings, &host_environment(), &spec.app, &spec.app, &json!({})).await
         }
         Err(error) => Tried { ok: false, text: error },
     }
 }
 
 pub fn tools_of(settings: &Settings, app: &str) -> Vec<String> {
-    crate::snapshot::tool_names(app, settings.commands.get(app))
+    crate::spec::tool_names(app, settings.commands.get(app))
 }
 
-pub fn parse_values(settings: &Settings, app: &str, tool: &str, text: &str) -> Value {
-    let inputs = match settings.commands.get(app) {
-        Some(CommandApp::Single(crate::config::Command::Object(object))) => object.inputs.clone(),
-        Some(CommandApp::Group(group)) => {
-            group.members.get(tool).and_then(decode_command).and_then(|command| match command {
-                crate::config::Command::Object(object) => object.inputs,
-                crate::config::Command::Text(_) => None,
-            })
-        }
-        _ => None,
-    }
-    .unwrap_or_default();
-    let values: Map<String, Value> = text
-        .split_whitespace()
-        .filter_map(|pair| pair.split_once('='))
-        .filter(|(name, _)| !name.is_empty())
+pub fn values_from_pairs(settings: &Settings, app: &str, tool: &str, pairs: &[(String, String)]) -> Value {
+    let inputs = crate::spec::lookup(settings, app, tool).map(|spec| spec.inputs).unwrap_or_default();
+    let values: Map<String, Value> = pairs
+        .iter()
         .map(|(name, value)| {
             let kind = inputs.get(name).and_then(|input| input.kind);
             let parsed = match kind {
@@ -310,111 +262,109 @@ pub fn parse_values(settings: &Settings, app: &str, tool: &str, text: &str) -> V
                     .map_or_else(|| json!(value), |number| json!(number)),
                 _ => json!(value),
             };
-            (name.to_owned(), parsed)
+            (name.clone(), parsed)
         })
         .collect();
 
     Value::Object(values)
 }
 
-pub async fn verdict(config: &Config, app: &str) -> (bool, Vec<String>) {
-    let settings = config.load().map(|loaded| loaded.settings).unwrap_or_default();
-    let links = apps_from(&settings, &host_environment(), None).links;
-    let names = crate::links::links_for_app(&links, app);
-    let Some(state) = reload_daemon().await else {
-        return (
-            true,
-            vec![if names.is_empty() {
-                format!("Saved {app}. Share it on a link in the Links tab.")
-            } else {
-                format!("Saved {app} on {}. It goes live when porchlight starts.", names.join(", "))
-            }],
-        );
-    };
-    let problems: Vec<String> =
-        state.problems.iter().filter(|problem| problem.app == app).map(|problem| problem.message.clone()).collect();
-    let refused =
-        state.servers.iter().find(|server| server.name == app && server.state == crate::links::ServerState::Refused);
-
-    if !problems.is_empty() || refused.is_some() {
-        let reason = if problems.is_empty() {
-            refused.map(|server| server.detail.clone()).unwrap_or_default()
-        } else {
-            problems.join("; ")
-        };
-        return (false, vec![format!("Couldn't share {app}: {reason}")]);
-    }
-
-    if names.is_empty() {
-        return (true, vec![format!("Saved {app}. Share it on a link in the Links tab.")]);
-    }
-
-    (
-        true,
-        names
-            .iter()
-            .map(|link| {
-                format!("Add {}{} in your MCP client, then approve it here.", state.public_url, link_path(link))
-            })
-            .collect(),
-    )
+pub struct Placement {
+    pub link: String,
+    pub address: Option<String>,
 }
 
-pub async fn share_mcp(config: &Config, name: &str, server: &Value) -> Vec<String> {
-    if let Err(error) = add_mcp(config, name, server) {
-        return vec![format!("✗ {name}: {}", error.message)];
+pub struct Shared {
+    pub app: String,
+    pub placements: Vec<Placement>,
+    pub running: bool,
+    pub created: Vec<String>,
+    pub turned_off: Vec<String>,
+    pub reapproval: bool,
+    pub problem: Option<String>,
+}
+
+pub async fn shared(config: &Config, app: &str) -> Shared {
+    let settings = config.load().map(|loaded| loaded.settings).unwrap_or_default();
+    let links = crate::links::links_for_app(&apps_from(&settings, &host_environment(), None).links, app);
+    let state = reload_daemon().await;
+    let problem = state.as_ref().and_then(|state| {
+        let problems: Vec<&str> = state
+            .problems
+            .iter()
+            .filter(|problem| problem.app == app)
+            .map(|problem| problem.message.as_str())
+            .collect();
+        let refused = state
+            .servers
+            .iter()
+            .find(|server| server.name == app && server.state == crate::links::ServerState::Refused)
+            .map(|server| server.detail.clone());
+        if problems.is_empty() { refused } else { Some(problems.join("; ")) }
+    });
+
+    Shared {
+        app: app.to_owned(),
+        placements: links
+            .into_iter()
+            .map(|link| {
+                let address = state.as_ref().map(|state| format!("{}{}", state.public_url, link_path(&link)));
+                Placement { link, address }
+            })
+            .collect(),
+        running: state.is_some(),
+        created: Vec::new(),
+        turned_off: Vec::new(),
+        reapproval: false,
+        problem,
+    }
+}
+
+pub async fn add_command(
+    config: &Config,
+    settings: &Settings,
+    spec: &CommandSpec,
+    links: &[String],
+    approved_links: &[String],
+) -> Result<Shared, ConfigError> {
+    if let Some(link) = links.iter().find(|link| !is_app_name(link) || settings.mcp.contains_key(*link)) {
+        return Err(ConfigError { message: format!("{link} can't be a command-tool link") });
     }
 
+    write_command(config, spec)?;
+    set_links_of(config, &config.load()?.settings, &spec.app, links)?;
+
+    Ok(Shared {
+        created: links.iter().filter(|link| !settings.links.contains_key(*link)).cloned().collect(),
+        reapproval: links.iter().any(|link| approved_links.contains(link)),
+        ..shared(config, &spec.app).await
+    })
+}
+
+pub async fn share_server(config: &Config, name: &str, server: &Value) -> Result<Shared, ConfigError> {
+    add_mcp(config, name, server)?;
     let state = reload_daemon().await;
-    let risky: Vec<String> = state
+    let turned_off: Vec<String> = state
         .iter()
         .flat_map(|state| state.servers.iter())
         .filter(|view| view.name == name)
         .flat_map(|view| view.catalog.iter())
-        .filter(|tool| tool.dangerous && tool.on)
+        .filter(|tool| tool.risk == crate::policy::Level::RunsCode && tool.on)
         .map(|tool| tool.tool.clone())
         .collect();
 
-    if !risky.is_empty() {
-        let _ = tools_off(config, name, &risky);
+    if !turned_off.is_empty() {
+        tools_off(config, name, &turned_off)?;
         reload_daemon().await;
     }
 
-    let (_, mut lines) = verdict(config, name).await;
-
-    if !risky.is_empty() {
-        lines.push(format!("▲ {} can run code, so they're off. Allow them from the Links tab (D).", risky.join(", ")));
-    }
-
-    lines
-}
-
-pub struct ToolSetup {
-    pub run: String,
-    pub description: Option<String>,
-    pub read_only: bool,
+    Ok(Shared { turned_off, ..shared(config, name).await })
 }
 
 fn tool_value(settings: &Settings, app: &str, tool: &str) -> Option<Value> {
     match settings.commands.get(app)? {
         CommandApp::Single(command) => serde_json::to_value(command).ok(),
         CommandApp::Group(group) => group.members.get(tool).cloned(),
-    }
-}
-
-pub fn tool_setup(settings: &Settings, app: &str, tool: &str) -> Option<ToolSetup> {
-    let words = |run: &crate::config::Words| match run {
-        crate::config::Words::One(text) => text.clone(),
-        crate::config::Words::Many(words) => words.join(" "),
-    };
-
-    match decode_command(&tool_value(settings, app, tool)?)? {
-        crate::config::Command::Text(run) => Some(ToolSetup { run, description: None, read_only: false }),
-        crate::config::Command::Object(object) => Some(ToolSetup {
-            run: words(&object.run),
-            description: object.description.clone(),
-            read_only: object.read_only == Some(true),
-        }),
     }
 }
 
@@ -432,7 +382,7 @@ pub fn edit_tool(
         Value::Object(object) => object,
         _ => Map::new(),
     };
-    object.insert("run".into(), run_value(words));
+    object.insert("run".into(), crate::spec::run_value(words));
 
     if description.is_empty() {
         object.remove("description");

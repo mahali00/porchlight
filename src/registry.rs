@@ -1,8 +1,9 @@
-use crate::apps::AppSpec;
 use crate::core::Tool;
 use crate::links::{LinkEntry, LinkPlan, PhysicalApp, Projection, ServerState};
-use crate::policy::{Rules, allowed_tool_names, app_default_on};
-use crate::sources::{ListChange, Notices};
+use crate::policy::{Rules, allowed_tool_names, app_default_on, valid_tool_name};
+use crate::rpc::ListChange;
+use crate::sources::AppSpec;
+use crate::sources::Notices;
 use crate::store::Store;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
@@ -91,31 +92,50 @@ fn notices_of(inventories: BoxStream<'static, Inventory>, initial: Inventory) ->
 fn waiting(entry: &PhysicalApp) -> PhysicalApp {
     PhysicalApp {
         state: ServerState::Waiting,
-        detail: format!("waiting for {} to start", entry.spec.name),
+        detail: match &entry.spec.source {
+            crate::sources::SourceSpec::Http { url, .. } => format!("can't reach {url} · retrying"),
+            _ => format!("waiting for {} to start", entry.spec.name),
+        },
         ..entry.clone()
     }
 }
 
 fn checked(entry: &PhysicalApp, tools: Vec<Tool>, rules: &Rules) -> PhysicalApp {
+    let invalid: Vec<String> =
+        tools.iter().filter(|tool| !valid_tool_name(&tool.name)).map(|tool| tool.name.clone()).collect();
+    let tools: Vec<Tool> = tools.into_iter().filter(|tool| valid_tool_name(&tool.name)).collect();
     let allowed = allowed_tool_names(&tools, rules, &entry.spec.name);
     let default_on = app_default_on(rules, &entry.spec.name);
     let dangerous: Vec<&str> = tools
         .iter()
-        .filter(|tool| allowed.contains(&tool.name) && entry.spec.source.risky(tool))
+        .filter(|tool| allowed.contains(&tool.name) && entry.spec.source.risk(tool).runs_code)
         .map(|tool| tool.name.as_str())
         .collect();
 
     if dangerous.is_empty() || entry.spec.allow_dangerous {
-        let detail = format!("{} of {} tools", allowed.len(), tools.len());
+        let detail = if invalid.is_empty() {
+            format!("{} of {} tools", allowed.len(), tools.len())
+        } else {
+            format!("{} of {} tools; ignored invalid tool names: {}", allowed.len(), tools.len(), invalid.join(", "))
+        };
         return PhysicalApp { tools, allowed, default_on, state: ServerState::Live, detail, ..entry.clone() };
     }
 
     let named: Vec<&str> = dangerous.into_iter().take(5).collect();
-    let detail = format!(
-        "refused: {} can run commands or code. Turn them off with \"{}/<tool>\": false in tools, or set allowDangerous if you trust every client",
-        named.join(", "),
-        entry.spec.name
-    );
+    let detail = if invalid.is_empty() {
+        format!(
+            "refused: {} can run commands or code. Turn them off with \"{}/<tool>\": false in tools, or set allowDangerous if you trust every client",
+            named.join(", "),
+            entry.spec.name
+        )
+    } else {
+        format!(
+            "refused: {} can run commands or code. Turn them off with \"{}/<tool>\": false in tools, or set allowDangerous if you trust every client; ignored invalid tool names: {}",
+            named.join(", "),
+            entry.spec.name,
+            invalid.join(", ")
+        )
+    };
 
     PhysicalApp { tools, allowed, default_on, state: ServerState::Refused, detail, ..entry.clone() }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "porchlight"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -9,6 +9,7 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "=4.6.0"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 form_urlencoded = "1.2.2"
 futures = "0.3.34"
@@ -21,7 +22,7 @@ hyper-util = "0.1.21"
 indexmap = { version = "2.14.2", features = ["serde"] }
 jsonc-parser = { version = "0.33.2", features = ["cst", "serde"] }
 maud = "0.27.0"
-nix = { version = "0.31.3", features = ["signal", "process"] }
+nix = { version = "0.31.3", features = ["signal", "process", "fs", "user"] }
 rand = "0.10.3"
 ratatui = "0.30.2"
 regex = "1.13.1"
