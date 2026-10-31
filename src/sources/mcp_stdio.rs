@@ -155,9 +155,16 @@ impl StdioSource {
     }
 
     fn reserve(&self) -> bool {
-        self.sessions_live
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < MAX_SESSIONS).then_some(count + 1))
-            .is_ok()
+        let mut count = self.sessions_live.load(Ordering::Acquire);
+
+        while count < MAX_SESSIONS {
+            match self.sessions_live.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(current) => count = current,
+            }
+        }
+
+        false
     }
 
     async fn evict_idlest(&self) -> bool {
