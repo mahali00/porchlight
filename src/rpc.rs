@@ -1,5 +1,4 @@
 use crate::core::Tool;
-use crate::sources::{ListChange, UpstreamError};
 use axum::body::Body;
 use axum::response::Response;
 use bytes::Bytes;
@@ -8,7 +7,61 @@ use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::time::Duration;
+
+pub const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
+
+pub fn query_params(query: Option<&str>) -> HashMap<String, String> {
+    form_urlencoded::parse(query.unwrap_or_default().as_bytes()).into_owned().collect()
+}
+
+pub fn form_params(headers: &HeaderMap, body: &[u8]) -> HashMap<String, String> {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/json"));
+
+    if is_json {
+        return serde_json::from_slice::<serde_json::Map<String, Value>>(body)
+            .map(|fields| {
+                fields
+                    .into_iter()
+                    .filter_map(|(key, value)| value.as_str().map(|text| (key, text.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    form_urlencoded::parse(body).into_owned().collect()
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct UpstreamError {
+    pub message: String,
+}
+
+impl UpstreamError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into() }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListChange {
+    Tools,
+    Resources,
+}
+
+impl ListChange {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tools => "tools",
+            Self::Resources => "resources",
+        }
+    }
+}
 
 pub const MAX_PAYLOAD_BYTES: usize = 256_000;
 
@@ -46,7 +99,10 @@ pub fn rpc_error(id: Option<&Value>, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id.cloned().unwrap_or(Value::Null), "error": { "code": code, "message": message } })
 }
 
-pub fn rpc_result(id: Option<&Value>, result: Value) -> Value {
+pub fn rpc_result(id: Option<&Value>, mut result: Value) -> Value {
+    if let Some(object) = result.as_object_mut() {
+        object.insert("resultType".into(), json!("complete"));
+    }
     let mut reply = serde_json::Map::new();
     reply.insert("jsonrpc".into(), json!("2.0"));
     reply.insert("id".into(), id.cloned().unwrap_or(Value::Null));

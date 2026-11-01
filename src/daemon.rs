@@ -2,10 +2,11 @@ use crate::approval::ApprovalPages;
 use crate::auth::Auth;
 use crate::client_metadata::ClientMetadata;
 use crate::config::Config;
-use crate::control::{self, DaemonState, state_of};
+use crate::control::{self, state_of};
 use crate::gateway::{Gateway, ListenError, bind};
 use crate::registry::Registry;
 use crate::serve::{Daemon, Reload, Reloader, Shared, upkeep};
+use crate::state::DaemonState;
 use crate::store::{Store, StoreError};
 use crate::system;
 use crate::tunnels::TunnelError;
@@ -59,7 +60,7 @@ pub async fn start(options: Options, config: Config, store: Store) -> Result<Run
     let reload: Arc<dyn Reload> = reloader.clone();
     let mut tasks = vec![
         Gateway::new(daemon.clone(), shared.clone())?.serve(gateway_listener),
-        ApprovalPages::new(daemon.clone(), reload.clone(), shared.clone()).serve(approval_listener),
+        ApprovalPages::new(daemon.clone(), shared.clone()).serve(approval_listener),
         upkeep(store, daemon.clone()),
     ];
 

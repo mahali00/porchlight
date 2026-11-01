@@ -1,9 +1,10 @@
-use crate::apps::AppSpec;
 use crate::core::{Tool, exposed_name, resource_uri};
+use crate::policy::Risk;
 use crate::sources::commands::{CommandSource, CommandTool, CommandsSpec, command_tools};
-use crate::sources::{CommandContribution, Notices, Source};
+use crate::sources::{AppSpec, CommandContribution, Notices, Source};
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +47,7 @@ pub struct LinkEntry {
     pub filter_resources: bool,
     pub origins: IndexMap<String, ToolOrigin>,
     pub resources: IndexMap<String, String>,
+    pub risks: IndexMap<String, Risk>,
 }
 
 pub struct Projection<'a> {
@@ -73,11 +75,15 @@ impl LinkPlan {
 
     pub fn signature(&self) -> String {
         match self {
-            Self::Direct { app, .. } => format!("direct:{app}"),
+            Self::Direct { app, .. } => format!("direct:{}:{app}", app.len()),
             Self::Commands { membership, .. } => {
                 let mut sorted = membership.clone();
                 sorted.sort();
-                format!("commands:{}", sorted.join(","))
+                let encoded = sorted.iter().fold(String::new(), |mut encoded, member| {
+                    let _ = write!(encoded, "{}:{member}", member.len());
+                    encoded
+                });
+                format!("commands:{encoded}")
             }
         }
     }
@@ -98,6 +104,7 @@ impl LinkPlan {
                     .iter()
                     .map(|tool| (tool.name.clone(), ToolOrigin { app: app.clone(), tool: tool.name.clone() }))
                     .collect();
+                let risks = entry.tools.iter().map(|tool| (tool.name.clone(), entry.spec.source.risk(tool))).collect();
 
                 Some(LinkEntry {
                     name: name.clone(),
@@ -112,6 +119,7 @@ impl LinkPlan {
                     filter_resources: false,
                     origins,
                     resources: IndexMap::new(),
+                    risks,
                 })
             }
             Self::Commands { name, apps, membership } => Some(project_commands(name, apps, membership, context)),
@@ -125,6 +133,7 @@ fn project_commands(name: &str, apps: &[String], membership: &[String], context:
     let mut tools: IndexMap<String, CommandTool> = IndexMap::new();
     let mut origins: IndexMap<String, ToolOrigin> = IndexMap::new();
     let mut resources: IndexMap<String, String> = IndexMap::new();
+    let mut risks: IndexMap<String, Risk> = IndexMap::new();
     let mut allowed = IndexSet::new();
     let mut instructions = vec![format!("Command-line tools shared on {name}, named app_tool.")];
 
@@ -136,6 +145,7 @@ fn project_commands(name: &str, apps: &[String], membership: &[String], context:
 
         for (tool, command) in &contribution.tools {
             let exposed = exposed_name(app, tool);
+            risks.insert(exposed.clone(), command.risk());
             tools.insert(exposed.clone(), command.clone());
             origins.insert(exposed.clone(), ToolOrigin { app: app.clone(), tool: tool.clone() });
 
@@ -181,6 +191,7 @@ fn project_commands(name: &str, apps: &[String], membership: &[String], context:
         filter_resources: true,
         origins,
         resources,
+        risks,
     }
 }
 

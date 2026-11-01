@@ -70,9 +70,9 @@ impl Provider {
         }
     }
 
-    pub async fn install(self, quiet: bool) -> bool {
+    pub async fn install(self) -> bool {
         match self {
-            Self::OpenTunnel => opentunnel::install(quiet).await,
+            Self::OpenTunnel => opentunnel::install().await,
         }
     }
 

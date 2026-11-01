@@ -1,10 +1,12 @@
-use crate::core::{now_ms, truncate};
+use crate::core::{Tool, now_ms, truncate};
 use crate::crypto::{hmac, safe_equal};
 use crate::links::{LinkEntry, ServerState, ToolOrigin};
+use crate::policy::{is_dangerous, valid_tool_name};
+use crate::rpc::UpstreamError;
 use crate::rpc::{
     self, Keep, ListKey, call_outcomes, decode_batch, filter_list, id_key, parse_error, payloads_within, rpc_error,
 };
-use crate::sources::{SourceRequest, UpstreamError};
+use crate::sources::SourceRequest;
 use crate::store::{AuditFields, Outcome, Store, StoreError};
 use axum::body::Body;
 use axum::response::Response;
@@ -49,7 +51,7 @@ const AUDIT_COPY_LIMIT: usize = 8 * 1024 * 1024;
 
 const HANDSHAKE_METHODS: [&str; 3] = ["initialize", "server/discover", "ping"];
 
-const CLIENT_METHODS: [&str; 14] = [
+const CLIENT_METHODS: [&str; 15] = [
     "initialize",
     "server/discover",
     "ping",
@@ -60,6 +62,7 @@ const CLIENT_METHODS: [&str; 14] = [
     "resources/read",
     "resources/subscribe",
     "resources/unsubscribe",
+    "subscriptions/listen",
     "prompts/list",
     "prompts/get",
     "completion/complete",
@@ -249,13 +252,14 @@ fn observed(response: Response, calls: Vec<RpcMessage>, context: Arc<Context>, s
 pub struct McpSurface {
     store: Store,
     session_key: String,
+    refused: Arc<std::sync::Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 impl McpSurface {
     pub fn new(store: Store) -> Result<Self, StoreError> {
         let session_key = store.session_key()?;
 
-        Ok(Self { store, session_key })
+        Ok(Self { store, session_key, refused: Arc::new(std::sync::Mutex::new(HashMap::new())) })
     }
 
     fn seal(&self, grant: &str, session: &str) -> String {
@@ -295,7 +299,14 @@ impl McpSurface {
         }
 
         if let Some(blocked) = messages.iter().find(|message| {
-            message.method.as_deref() == Some("tools/call") && !server.allowed.contains(tool_name(message))
+            let name = tool_name(message);
+            let caught_up = server.tools.iter().any(|known| known.name == name && is_dangerous(known));
+            let was_refused = !caught_up
+                && self
+                    .refused
+                    .lock()
+                    .is_ok_and(|refused| refused.get(&server.name).is_some_and(|names| names.contains(name)));
+            message.method.as_deref() == Some("tools/call") && (!server.allowed.contains(name) || was_refused)
         }) {
             context.refuse("tool.blocked", tool_name(blocked), Some(input_of(blocked)))?;
             let message = format!("Tool not allowed: {}", tool_name(blocked));
@@ -337,8 +348,32 @@ impl McpSurface {
         let method_listed = |name: &str| messages.iter().any(|message| message.method.as_deref() == Some(name));
         let tools_listed = if method_listed("tools/list") {
             let allowed = server.allowed.clone();
+            let refused = self.refused.clone();
+            let link = server.clone();
             let keep: Keep = Arc::new(move |tool| {
-                tool.get("name").and_then(Value::as_str).is_some_and(|name| allowed.contains(name))
+                let Some(name) = tool.get("name").and_then(Value::as_str) else { return false };
+                if !valid_tool_name(name) {
+                    return false;
+                }
+
+                let parsed = serde_json::from_value::<Tool>(Value::Object(tool.clone())).ok();
+                if let Some(parsed) = parsed {
+                    let dangerous = is_dangerous(&parsed);
+                    let previously_dangerous = link.tools.iter().any(|old| old.name == name && is_dangerous(old));
+                    if let Ok(mut refused) = refused.lock() {
+                        let names = refused.entry(link.name.clone()).or_default();
+                        if dangerous && !previously_dangerous {
+                            names.insert(name.to_owned());
+                        } else {
+                            names.remove(name);
+                        }
+                    }
+                }
+
+                allowed.contains(name)
+                    && !refused
+                        .lock()
+                        .is_ok_and(|refused| refused.get(&link.name).is_some_and(|names| names.contains(name)))
             });
             filter_list(response, ListKey::Tools, keep).await?
         } else {

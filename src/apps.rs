@@ -1,22 +1,13 @@
-use crate::config::{
-    COMMAND_KEYS, Command, CommandApp, CommandObject, GROUP_SETTINGS, Input, InputType, McpServer, Settings, Words,
-    decode_command, suggest,
-};
+use crate::config::{COMMAND_KEYS, CommandApp, Input, InputType, McpServer, Settings, suggest};
 use crate::core::{Problem, exposed_name, is_tool_name, is_usable_name};
 use crate::links::LinkPlan;
 use crate::policy::{Rules, rules_from};
 use crate::sources::commands::{CommandTool, Lookup, LookupKind, Part, Word, literal, parse_word, sole_input};
-use crate::sources::{CommandContribution, SourceSpec};
+use crate::sources::{AppSpec, CommandContribution, SourceSpec};
+use crate::spec::{CommandSpec, expand_home, members, split_run};
 use indexmap::{IndexMap, IndexSet};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AppSpec {
-    pub name: String,
-    pub source: SourceSpec,
-    pub allow_dangerous: bool,
-}
 
 pub type ReadFile = Box<dyn Fn(&Path) -> Option<String> + Send + Sync>;
 
@@ -39,93 +30,6 @@ pub struct Apps {
     pub rules: Rules,
     pub problems: Vec<Problem>,
     pub links: Vec<LinkPlan>,
-}
-
-pub fn slugify(value: &str) -> String {
-    let mut slug = String::new();
-
-    for c in value.to_lowercase().chars() {
-        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
-            slug.push(c);
-        } else if !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-
-    let trimmed = slug.trim_matches('-');
-
-    if trimmed.is_empty() { "server".to_owned() } else { trimmed.to_owned() }
-}
-
-pub fn expand_home(word: &str) -> String {
-    let home = || std::env::home_dir().unwrap_or_default();
-
-    if word == "~" {
-        return home().display().to_string();
-    }
-
-    match word.strip_prefix("~/") {
-        Some(rest) => home().join(rest).display().to_string(),
-        None => word.to_owned(),
-    }
-}
-
-pub fn command_words(command: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut started = false;
-
-    for c in command.chars() {
-        if escaped {
-            word.push(c);
-            escaped = false;
-            started = true;
-        } else if c == '\\' && quote != Some('\'') {
-            escaped = true;
-            started = true;
-        } else if let Some(open) = quote {
-            if c == open {
-                quote = None;
-            } else {
-                word.push(c);
-            }
-        } else if c == '\'' || c == '"' {
-            quote = Some(c);
-            started = true;
-        } else if c.is_whitespace() {
-            if started {
-                words.push(expand_home(&word));
-            }
-
-            word.clear();
-            started = false;
-        } else {
-            word.push(c);
-            started = true;
-        }
-    }
-
-    if escaped {
-        word.push('\\');
-    }
-
-    if started {
-        words.push(expand_home(&word));
-    }
-
-    words
-}
-
-fn split_run(run: &Words) -> Vec<String> {
-    match run {
-        Words::One(text) => command_words(text),
-        Words::Many(words) => match words.as_slice() {
-            [only] if only.trim().contains(char::is_whitespace) && !Path::new(only).exists() => command_words(only),
-            _ => words.iter().map(|word| expand_home(word)).collect(),
-        },
-    }
 }
 
 fn lookup_in(environment: &Environment) -> impl Fn(LookupKind, &str) -> Option<String> + '_ {
@@ -167,13 +71,6 @@ fn parse_run(run: &[String], lookup: Lookup) -> Result<Vec<Word>, String> {
     run.iter().map(|word| parse_word(word, lookup)).collect()
 }
 
-#[derive(Default)]
-struct Inherited {
-    environment: IndexMap<String, String>,
-    cwd: Option<String>,
-    allow_dangerous: bool,
-}
-
 fn input_problem(words: &[Word], inputs: &IndexMap<String, Input>) -> Option<String> {
     for (name, input) in inputs {
         let numeric = matches!(input.kind, Some(InputType::Integer | InputType::Number));
@@ -208,77 +105,32 @@ fn input_problem(words: &[Word], inputs: &IndexMap<String, Input>) -> Option<Str
     None
 }
 
-struct Compiled {
-    tool: CommandTool,
-    allow_dangerous: bool,
-}
-
-fn compile_command(command: &Command, inherited: &Inherited, environment: &Environment) -> Result<Compiled, String> {
-    let text_settings;
-    let settings = match command {
-        Command::Text(run) => {
-            text_settings = CommandObject {
-                run: Words::One(run.clone()),
-                description: None,
-                read_only: None,
-                resource: None,
-                inputs: None,
-                environment: None,
-                cwd: None,
-                allow_dangerous: None,
-            };
-            &text_settings
-        }
-        Command::Object(object) => object,
-    };
-    let run = split_run(&settings.run);
+fn compile_command(spec: &CommandSpec, environment: &Environment) -> Result<CommandTool, String> {
     let lookup = lookup_in(environment);
-    let words = resolve_program(parse_run(&run, &lookup)?, environment)?;
-    let resource = settings.resource == Some(true);
+    let words = resolve_program(parse_run(&spec.run, &lookup)?, environment)?;
 
-    if resource && words.iter().flatten().any(|part| matches!(part, Part::Input(_))) {
+    if spec.resource && words.iter().flatten().any(|part| matches!(part, Part::Input(_))) {
         return Err("a resource can't take inputs".to_owned());
     }
 
-    let inputs = settings.inputs.clone().unwrap_or_default();
+    if let Some(effect) = spec.risk().effect.filter(|_| spec.resource) {
+        return Err(format!("a resource runs whenever a client reads it, so it can't be a command that {effect}"));
+    }
 
-    if let Some(problem) = input_problem(&words, &inputs) {
+    if let Some(problem) = input_problem(&words, &spec.inputs) {
         return Err(problem);
     }
 
-    let mut merged = inherited.environment.clone();
-    merged.extend(settings.environment.clone().unwrap_or_default());
-    let variables = expand_values(&merged, &lookup)?;
-    let cwd = settings.cwd.clone().or_else(|| inherited.cwd.clone());
-
-    Ok(Compiled {
-        tool: CommandTool {
-            words,
-            template: run.join(" "),
-            description: settings.description.clone(),
-            read_only: settings.read_only == Some(true) || resource,
-            resource,
-            inputs,
-            environment: variables,
-            cwd: cwd.map(|cwd| expand_home(&cwd)),
-        },
-        allow_dangerous: settings.allow_dangerous.unwrap_or(inherited.allow_dangerous),
+    Ok(CommandTool {
+        words,
+        template: spec.shown(),
+        description: spec.description.clone(),
+        read_only: spec.read_only || spec.resource,
+        resource: spec.resource,
+        inputs: spec.inputs.clone(),
+        environment: expand_values(&spec.environment, &lookup)?,
+        cwd: spec.cwd.as_deref().map(expand_home),
     })
-}
-
-fn is_dangerous_app(app: &CommandApp) -> bool {
-    match app {
-        CommandApp::Single(Command::Text(_)) => false,
-        CommandApp::Single(Command::Object(object)) => object.allow_dangerous == Some(true),
-        CommandApp::Group(group) => {
-            group.allow_dangerous == Some(true)
-                || group
-                    .members
-                    .values()
-                    .filter_map(decode_command)
-                    .any(|member| matches!(member, Command::Object(object) if object.allow_dangerous == Some(true)))
-        }
-    }
 }
 
 struct CompiledApps {
@@ -291,38 +143,24 @@ fn problem(app: &str, message: String) -> Problem {
 }
 
 fn command_app(name: &str, app: &CommandApp, environment: &Environment) -> CompiledApps {
-    let members: Vec<(String, Option<Command>)> = match app {
-        CommandApp::Single(command) => vec![(name.to_owned(), Some(command.clone()))],
-        CommandApp::Group(group) => group
-            .members
-            .iter()
-            .filter(|(key, _)| !GROUP_SETTINGS.contains(&key.as_str()))
-            .map(|(key, value)| (key.clone(), decode_command(value)))
-            .collect(),
-    };
-    let inherited = match app {
-        CommandApp::Single(_) => Inherited::default(),
-        CommandApp::Group(group) => Inherited {
-            environment: group.environment.clone().unwrap_or_default(),
-            cwd: group.cwd.clone(),
-            allow_dangerous: group.allow_dangerous == Some(true),
-        },
-    };
     let mut problems = Vec::new();
     let mut compiled = Vec::new();
+    let mut allow_dangerous = matches!(app, CommandApp::Group(group) if group.allow_dangerous == Some(true));
 
-    for (tool, member) in members {
+    for (tool, spec) in members(name, app) {
         let place = if tool == name { name.to_owned() } else { format!("{name}/{tool}") };
 
-        match member {
-            Some(command) if !COMMAND_KEYS.contains(&tool.as_str()) => {
+        match spec {
+            Some(spec) if !COMMAND_KEYS.contains(&tool.as_str()) => {
+                allow_dangerous |= spec.allow_dangerous;
+
                 if !is_tool_name(&tool) {
                     problems.push(problem(name, format!("{place}: tool names use letters, numbers, _ and - only")));
                     continue;
                 }
 
-                match compile_command(&command, &inherited, environment) {
-                    Ok(success) => compiled.push((tool, success)),
+                match compile_command(&spec, environment) {
+                    Ok(command) => compiled.push((tool, command)),
                     Err(failure) => problems.push(problem(name, format!("{place}: {failure}"))),
                 }
             }
@@ -330,14 +168,13 @@ fn command_app(name: &str, app: &CommandApp, environment: &Environment) -> Compi
         }
     }
 
-    let allow_dangerous = is_dangerous_app(app) || compiled.iter().any(|(_, success)| success.allow_dangerous);
     let mut fitting = IndexMap::new();
 
-    for (tool, success) in compiled {
+    for (tool, command) in compiled {
         let exposed = exposed_name(name, &tool);
 
         if exposed.len() <= 64 {
-            fitting.insert(tool, success.tool);
+            fitting.insert(tool, command);
         } else {
             problems.push(problem(name, format!("{name}/{tool}: {exposed} is longer than 64 characters")));
         }
@@ -488,15 +325,4 @@ pub fn apps_from(settings: &Settings, environment: &Environment, configured: Opt
         problems: compiled.problems.into_iter().chain(link_problems).collect(),
         links,
     }
-}
-
-pub fn template_words(run: &[String]) -> Vec<Word> {
-    let keep = |kind: LookupKind, name: &str| {
-        Some(match kind {
-            LookupKind::Env => format!("{{env:{name}}}"),
-            LookupKind::File => format!("{{file:{name}}}"),
-        })
-    };
-
-    run.iter().map(|word| parse_word(word, &keep).unwrap_or_else(|_| vec![Part::Text(word.clone())])).collect()
 }

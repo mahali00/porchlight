@@ -1,5 +1,5 @@
 use crate::core::{link_path, now_ms};
-use crate::crypto::{approval_code, normalize_code, pkce_challenge, random_token, sha256};
+use crate::crypto::{approval_code, normalize_code, pkce_challenge, random_token, safe_equal, sha256};
 use crate::store::{AuditFields, NewPending, Store, StoreError, TokenKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,17 +14,13 @@ const DAY: i64 = 24 * HOUR;
 
 const PENDING_TTL: i64 = 10 * MINUTE;
 
-const TICKET_TTL: i64 = 2 * MINUTE;
-
-const DEVICE_CODE_TTL: i64 = 5 * MINUTE;
-
 const AUTHORIZATION_CODE_TTL: i64 = MINUTE;
 
 const ACCESS_TOKEN_TTL: i64 = HOUR;
 
 const REFRESH_TOKEN_TTL: i64 = 30 * DAY;
 
-const MAX_CODE_ATTEMPTS: i64 = 5;
+pub const MAX_CODE_ATTEMPTS: i64 = 5;
 
 const MAX_REGISTRATIONS_PER_HOUR: i64 = 30;
 
@@ -60,14 +56,10 @@ pub struct TokenPair {
     pub refresh: String,
 }
 
-struct Ticket {
-    request_id: String,
-    expires_at: i64,
-}
-
 struct AuthorizationCode {
     client_id: String,
     server: String,
+    redirect_uri: String,
     challenge: String,
     expires_at: i64,
 }
@@ -113,8 +105,8 @@ fn resource_matches(resource: &str, server: &str) -> bool {
 #[derive(Clone)]
 pub struct Auth {
     store: Store,
-    tickets: Arc<Mutex<HashMap<String, Ticket>>>,
     codes: Arc<Mutex<HashMap<String, AuthorizationCode>>>,
+    approved: Arc<Mutex<HashMap<String, i64>>>,
     code_lock: Arc<Mutex<()>>,
     streams: Streams,
     next_stream: Arc<AtomicU64>,
@@ -124,8 +116,8 @@ impl Auth {
     pub fn new(store: Store) -> Self {
         Self {
             store,
-            tickets: Arc::default(),
             codes: Arc::default(),
+            approved: Arc::default(),
             code_lock: Arc::default(),
             streams: Arc::default(),
             next_stream: Arc::default(),
@@ -181,12 +173,21 @@ impl Auth {
 
         let code = random_token(32);
 
+        self.store.pending_remove(request_id)?;
+
+        if let Ok(mut approved) = self.approved.lock() {
+            approved.retain(|_, at| *at >= now - PENDING_TTL);
+            approved.insert(request_id.to_owned(), now);
+        }
+
         let stored = self.codes.lock().map(|mut codes| {
+            codes.retain(|_, code| code.expires_at >= now);
             codes.insert(
                 code.clone(),
                 AuthorizationCode {
                     client_id: request.client_id.clone(),
                     server: request.server.clone(),
+                    redirect_uri: request.redirect_uri.clone(),
                     challenge: request.challenge.clone(),
                     expires_at: now + AUTHORIZATION_CODE_TTL,
                 },
@@ -198,7 +199,6 @@ impl Auth {
             return refused("Code store unavailable");
         }
 
-        self.store.pending_remove(request_id)?;
         self.store.audit_write("authz.completed", &format!("{} -> {}", request.client_id, request.server))?;
 
         Ok(Approval { code, redirect_uri: request.redirect_uri, state: request.state })
@@ -212,6 +212,7 @@ impl Auth {
         }
 
         let nonce = random_token(16);
+        let code = approval_code();
         let detail = format!("{} -> {}", request.client_id, request.server);
         self.store.pending_create(&NewPending {
             id: request.id,
@@ -221,6 +222,7 @@ impl Auth {
             challenge: request.challenge,
             nonce_hash: sha256(&nonce),
             state: request.state,
+            code,
             expires_at: now + PENDING_TTL,
         })?;
         self.store.audit_record(
@@ -237,45 +239,8 @@ impl Auth {
         Ok(nonce)
     }
 
-    pub fn issue_ticket(&self, request_id: &str) -> String {
-        let ticket = random_token(32);
-
-        let stored = self.tickets.lock().map(|mut tickets| {
-            tickets.insert(
-                ticket.clone(),
-                Ticket { request_id: request_id.to_owned(), expires_at: now_ms() + TICKET_TTL },
-            );
-        });
-
-        if stored.is_err() {
-            eprintln!("Couldn't keep an approval ticket: the ticket store is unusable after an earlier crash");
-        }
-
-        ticket
-    }
-
-    pub fn approve_with_ticket(
-        &self,
-        request_id: &str,
-        ticket: &str,
-        cookie_nonce: Option<&str>,
-    ) -> Result<Approval, AuthError> {
-        let issued = self.tickets.lock().ok().and_then(|mut tickets| tickets.remove(ticket));
-
-        if issued.is_none_or(|issued| issued.request_id != request_id || issued.expires_at < now_ms()) {
-            self.store.audit_write("authz.complete_failed", request_id)?;
-            return refused("Invalid ticket");
-        }
-
-        self.approve(request_id, cookie_nonce)
-    }
-
-    pub fn issue_device_code(&self, request_id: &str) -> Result<String, AuthError> {
-        let code = approval_code();
-        self.store.pending_set_code(request_id, &sha256(&code), now_ms() + DEVICE_CODE_TTL)?;
-        self.store.audit_write("authz.code_issued", request_id)?;
-
-        Ok(code)
+    pub fn was_approved(&self, request_id: &str) -> bool {
+        self.approved.lock().is_ok_and(|approved| approved.contains_key(request_id))
     }
 
     pub fn approve_with_code(
@@ -284,10 +249,10 @@ impl Auth {
         code: &str,
         cookie_nonce: Option<&str>,
     ) -> Result<Approval, AuthError> {
+        let _locked = self.code_lock.lock().map_err(|_| AuthError::Refused("Authorization unavailable"))?;
         let request = self.store.pending_get(request_id)?;
-        let Some((code_hash, attempts)) = request
-            .filter(|request| request.expires_at >= now_ms())
-            .and_then(|request| Some((request.code_hash?, request.attempts)))
+        let Some((expected_code, attempts)) =
+            request.filter(|request| request.expires_at >= now_ms()).map(|request| (request.code, request.attempts))
         else {
             return refused("Code expired");
         };
@@ -299,19 +264,41 @@ impl Auth {
 
         self.store.pending_record_attempt(request_id)?;
 
-        if sha256(&normalize_code(code)) != code_hash {
+        if !safe_equal(&normalize_code(code), &normalize_code(&expected_code)) {
+            if attempts + 1 >= MAX_CODE_ATTEMPTS {
+                self.store.pending_remove(request_id)?;
+                self.store.audit_write("authz.too_many_attempts", request_id)?;
+            }
             return refused("Invalid code");
         }
 
         self.approve(request_id, cookie_nonce)
     }
 
-    pub fn exchange_code(&self, code: &str, verifier: &str, resource: &str) -> Result<TokenPair, AuthError> {
-        let _locked = self.code_lock.lock();
+    pub fn exchange_code(
+        &self,
+        code: &str,
+        verifier: &str,
+        resource: &str,
+        client_id: &str,
+        redirect_uri: &str,
+    ) -> Result<TokenPair, AuthError> {
+        let _locked = self.code_lock.lock().map_err(|_| AuthError::Refused("Authorization unavailable"))?;
+
+        if !(43..=128).contains(&verifier.len())
+            || !verifier.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte))
+        {
+            return refused("Invalid PKCE verifier");
+        }
+
         let issued = self.codes.lock().ok().and_then(|mut codes| codes.remove(code));
         let Some(issued) = issued.filter(|issued| issued.expires_at >= now_ms()) else {
             return refused("invalid_grant");
         };
+
+        if issued.client_id != client_id || issued.redirect_uri != redirect_uri {
+            return refused("invalid_grant");
+        }
 
         if pkce_challenge(verifier) != issued.challenge {
             return refused("PKCE verification failed");
@@ -328,6 +315,7 @@ impl Auth {
     }
 
     pub fn refresh(&self, refresh_token: &str) -> Result<TokenPair, AuthError> {
+        let _locked = self.code_lock.lock().map_err(|_| AuthError::Refused("Authorization unavailable"))?;
         let Some(token) =
             self.store.token_get(&sha256(refresh_token))?.filter(|token| token.kind == TokenKind::Refresh)
         else {
@@ -338,8 +326,12 @@ impl Auth {
             return refused("Refresh token expired");
         }
 
+        if !self.store.grant_exists(&token.grant_id)? {
+            return refused("invalid_grant");
+        }
+
         if !self.store.token_claim(&token.hash)? {
-            self.store.tokens_revoke_grant(&token.grant_id)?;
+            self.revoke_grant_inner(&token.grant_id)?;
             self.store.audit_write("token.reuse_detected", &token.grant_id)?;
             return refused("Refresh token reused; grant revoked");
         }
@@ -349,11 +341,21 @@ impl Auth {
 
     pub fn still_allowed(&self, bearer: &str, server: &str) -> Result<Option<String>, AuthError> {
         let now = now_ms();
-        let token = self.store.token_get(&sha256(bearer))?.filter(|token| {
-            token.kind != TokenKind::Refresh && !token.revoked && token.expires_at > now && token.server == server
-        });
+        let token = self.store.token_get(&sha256(bearer))?;
+        let allowed = match token {
+            Some(token)
+                if token.kind != TokenKind::Refresh
+                    && !token.revoked
+                    && token.expires_at > now
+                    && token.server == server
+                    && self.store.grant_exists(&token.grant_id)? =>
+            {
+                Some(token.grant_id)
+            }
+            _ => None,
+        };
 
-        Ok(token.map(|token| token.grant_id))
+        Ok(allowed)
     }
 
     pub fn authorize(&self, bearer: &str, server: &str) -> Result<Option<String>, AuthError> {
@@ -366,14 +368,20 @@ impl Auth {
         Ok(grant)
     }
 
+    fn revoke_grant_inner(&self, id: &str) -> Result<bool, AuthError> {
+        self.store.tokens_revoke_grant(id)?;
+        let removed = self.store.grant_remove(id)?;
+        self.close_grant_streams(&[id.to_owned()]);
+        Ok(removed)
+    }
+
     pub fn revoke(&self, token: &str) -> Result<(), AuthError> {
+        let _locked = self.code_lock.lock().map_err(|_| AuthError::Refused("Authorization unavailable"))?;
         let Some(found) = self.store.token_get(&sha256(token))? else {
             return Ok(());
         };
         let client = self.store.grant_client(&found.grant_id)?;
-        self.store.tokens_revoke_grant(&found.grant_id)?;
-        self.store.grant_remove(&found.grant_id)?;
-        self.close_grant_streams(std::slice::from_ref(&found.grant_id));
+        self.revoke_grant_inner(&found.grant_id)?;
         self.store
             .audit_record("token.revoked", AuditFields { client, app: Some(found.server), ..AuditFields::default() })?;
 
@@ -388,15 +396,7 @@ impl Auth {
     }
 
     pub fn allow_registration(&self, ip: &str) -> Result<bool, AuthError> {
-        let recent = self.store.registrations_since(ip, now_ms() - HOUR)?;
-
-        if recent.total >= MAX_REGISTRATIONS_PER_HOUR {
-            return Ok(false);
-        }
-
-        self.store.registration_record(ip)?;
-
-        Ok(true)
+        Ok(self.store.registration_try_record(ip, now_ms() - HOUR, 5, MAX_REGISTRATIONS_PER_HOUR)?)
     }
 
     pub fn create_static_token(&self, server: &str, name: &str, ttl: i64) -> Result<(String, String), AuthError> {
@@ -410,9 +410,8 @@ impl Auth {
     }
 
     pub fn revoke_grant(&self, id: &str) -> Result<bool, AuthError> {
-        self.store.tokens_revoke_grant(id)?;
-        let removed = self.store.grant_remove(id)?;
-        self.close_grant_streams(&[id.to_owned()]);
+        let _locked = self.code_lock.lock().map_err(|_| AuthError::Refused("Authorization unavailable"))?;
+        let removed = self.revoke_grant_inner(id)?;
 
         if removed {
             self.store.audit_write("grant.revoked", id)?;
@@ -422,7 +421,7 @@ impl Auth {
     }
 
     pub fn revoke_server(&self, server: &str) -> Result<(), AuthError> {
-        let _locked = self.code_lock.lock();
+        let _locked = self.code_lock.lock().map_err(|_| AuthError::Refused("Authorization unavailable"))?;
         let grants: Vec<String> = self
             .store
             .grants_list()?
@@ -456,7 +455,7 @@ impl Auth {
     }
 
     pub fn revoke_all(&self) -> Result<(), AuthError> {
-        let _locked = self.code_lock.lock();
+        let _locked = self.code_lock.lock().map_err(|_| AuthError::Refused("Authorization unavailable"))?;
         let grants: Vec<String> = self.store.grants_list()?.into_iter().map(|grant| grant.id).collect();
         self.store.tokens_revoke_all()?;
         self.store.grants_remove_all()?;

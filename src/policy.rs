@@ -47,6 +47,76 @@ pub fn is_dangerous(tool: &Tool) -> bool {
         || parameter_names(tool).into_iter().any(|name| flagged(&DANGEROUS_PARAMETER, name))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Level {
+    #[serde(rename = "read-only")]
+    Reads,
+    Changes,
+    ClientChooses,
+    #[serde(rename = "runs-commands")]
+    RunsCode,
+}
+
+impl Level {
+    pub fn changes(self) -> bool {
+        self != Self::Reads
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Reads => "read-only",
+            Self::Changes => "changes things",
+            Self::ClientChooses => "changes things, client chooses",
+            Self::RunsCode => "runs commands",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Risk {
+    pub runs_code: bool,
+    pub claimed_read_only: bool,
+    pub effect: Option<&'static str>,
+    pub open: Vec<String>,
+}
+
+impl Risk {
+    pub fn level(&self) -> Level {
+        if self.runs_code {
+            Level::RunsCode
+        } else if self.claimed_read_only && self.effect.is_none() {
+            Level::Reads
+        } else if self.open.is_empty() {
+            Level::Changes
+        } else {
+            Level::ClientChooses
+        }
+    }
+
+    pub fn reads(&self) -> bool {
+        self.level() == Level::Reads
+    }
+
+    pub fn needs_person(&self) -> bool {
+        self.level() == Level::ClientChooses
+    }
+
+    pub fn contradiction(&self) -> Option<&'static str> {
+        self.effect.filter(|_| self.claimed_read_only)
+    }
+
+    pub fn summary(&self) -> String {
+        let level = self.level();
+
+        match self.effect.filter(|_| matches!(level, Level::Changes | Level::ClientChooses)) {
+            Some(effect) => level.word().replacen("changes things", effect, 1),
+            None => level.word().to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     app: String,
@@ -59,6 +129,12 @@ pub type Rules = Vec<Rule>;
 
 pub fn is_rule_pattern(pattern: &str) -> bool {
     matches!(pattern.split_once('/'), Some((app, tool)) if !app.is_empty() && !tool.is_empty() && !tool.contains('/'))
+}
+
+pub fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 fn glob_matches(glob: &[char], text: &[char]) -> bool {
@@ -104,7 +180,11 @@ pub fn app_default_on(rules: &Rules, app: &str) -> bool {
 }
 
 pub fn allowed_tool_names(tools: &[Tool], rules: &Rules, app: &str) -> IndexSet<String> {
-    tools.iter().filter(|tool| tool_on(rules, app, &tool.name)).map(|tool| tool.name.clone()).collect()
+    tools
+        .iter()
+        .filter(|tool| valid_tool_name(&tool.name) && tool_on(rules, app, &tool.name))
+        .map(|tool| tool.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -161,5 +241,24 @@ mod tests {
         assert!(!tool_on(&rules, "x", "write"));
         assert!(!app_default_on(&rules, "x"));
         assert!(app_default_on(&rules, "garage2"));
+    }
+}
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn invalid_upstream_tool_names_never_enter_allowed_names() {
+        let tools = ["read", "files/read", "app/*", "", &"a".repeat(129)]
+            .into_iter()
+            .map(|name| serde_json::from_value::<Tool>(json!({ "name": name })).unwrap())
+            .collect::<Vec<_>>();
+        let names = allowed_tool_names(&tools, &Rules::new(), "app");
+
+        assert_eq!(names, IndexSet::from(["read".to_owned()]));
+        assert!(!valid_tool_name("files/read"));
+        assert!(!valid_tool_name(""));
+        assert!(!valid_tool_name(&"a".repeat(129)));
     }
 }

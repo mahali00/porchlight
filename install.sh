@@ -41,12 +41,16 @@ else
   actual="$(shasum -a 256 "$temp/$file" | cut -d ' ' -f 1)"
 fi
 [ "$expected" = "$actual" ] || fail "the download doesn't match its checksum"
+if command -v gh >/dev/null 2>&1; then
+  gh attestation verify "$temp/$file" --repo "$repo" || fail "the download's build attestation could not be verified"
+fi
 
 tar -xzf "$temp/$file" -C "$temp"
 mkdir -p "$dir"
-rm -f "$dir/porchlight"
-mv "$temp/porchlight" "$dir/porchlight"
-chmod +x "$dir/porchlight"
+replacement="$(mktemp "$dir/.porchlight.XXXXXX")"
+cp "$temp/porchlight" "$replacement"
+chmod +x "$replacement"
+mv -f "$replacement" "$dir/porchlight"
 
 echo "✓ installed porchlight to $dir/porchlight"
 

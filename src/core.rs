@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Annotations {
@@ -107,4 +110,37 @@ pub fn truncate(text: &str, limit: usize) -> String {
         Some((end, _)) => format!("{}…", text.get(..end).unwrap_or(text)),
         None => text.to_owned(),
     }
+}
+
+pub fn state_dir() -> PathBuf {
+    std::env::var_os("PORCHLIGHT_HOME")
+        .map_or_else(|| std::env::home_dir().unwrap_or_default().join(".porchlight"), PathBuf::from)
+}
+
+pub fn in_state_dir(name: &str) -> PathBuf {
+    state_dir().join(name)
+}
+
+pub fn log_dir() -> PathBuf {
+    in_state_dir("logs")
+}
+
+pub fn config_path() -> PathBuf {
+    in_state_dir("porchlight.json")
+}
+
+pub fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+
+    for c in value.to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+            slug.push(c);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+
+    let trimmed = slug.trim_matches('-');
+
+    if trimmed.is_empty() { "server".to_owned() } else { trimmed.to_owned() }
 }

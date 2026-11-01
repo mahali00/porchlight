@@ -1,9 +1,11 @@
-use crate::config::in_state_dir;
 use crate::core::Problem;
+use crate::core::in_state_dir;
 use crate::gateway::ListenError;
+use crate::links::ServerState;
 use crate::registry::Registry;
 use crate::rpc::json;
-use crate::serve::{Daemon, Reload, ServerView, view_of};
+use crate::serve::{Daemon, Reload};
+use crate::state::{DaemonState, view_of};
 use crate::tunnels::tunnel_choice;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -11,9 +13,8 @@ use axum::response::Response;
 use http::{Method, StatusCode};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,16 +22,6 @@ use tokio::net::{UnixListener, UnixStream};
 
 pub fn socket_path() -> PathBuf {
     in_state_dir("control.sock")
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DaemonState {
-    pub pid: u32,
-    pub tunnel: String,
-    pub public_url: String,
-    pub servers: Vec<ServerView>,
-    pub problems: Vec<Problem>,
 }
 
 pub struct Control {
@@ -41,10 +32,11 @@ pub struct Control {
 
 pub async fn state_of(daemon: &Daemon, registry: &Registry, reload: &dyn Reload) -> DaemonState {
     let public_url = daemon.public_url();
-    let refused = registry
+    let refused: Vec<_> = registry
         .list()
         .into_iter()
-        .filter(|entry| entry.spec.source.report_refusal() && entry.state == crate::links::ServerState::Refused);
+        .filter(|entry| entry.spec.source.report_refusal() && entry.state == crate::links::ServerState::Refused)
+        .collect();
 
     DaemonState {
         pid: std::process::id(),
@@ -56,8 +48,9 @@ pub async fn state_of(daemon: &Daemon, registry: &Registry, reload: &dyn Reload)
         problems: reload
             .problems()
             .into_iter()
-            .chain(refused.map(|entry| Problem { app: entry.spec.name, message: entry.detail }))
+            .chain(refused.iter().map(|entry| Problem { app: entry.spec.name.clone(), message: entry.detail.clone() }))
             .collect(),
+        refused: refused.into_iter().map(|entry| entry.spec.name).collect(),
         public_url,
     }
 }
@@ -74,10 +67,15 @@ impl Control {
             .iter()
             .find(|candidate| candidate.name == tool)
             .ok_or_else(|| format!("{app} has no tool called {tool}"))?;
-        let read_only = found.annotations.as_ref().and_then(|annotations| annotations.read_only_hint) == Some(true);
+        let risk = physical.spec.source.risk(found);
 
-        if !read_only {
-            return Err(format!("{tool} may change things, so porchlight only runs it when a client calls it"));
+        if !try_allowed(
+            physical.state,
+            physical.allowed.contains(tool) && risk.claimed_read_only && risk.effect.is_none(),
+            risk.runs_code,
+            physical.spec.allow_dangerous,
+        ) {
+            return Err(format!("{tool} isn't available to try"));
         }
 
         let arguments = typed(&arguments, found.input_schema.as_ref());
@@ -85,6 +83,10 @@ impl Control {
 
         Ok(reply_text(&reply))
     }
+}
+
+fn try_allowed(state: ServerState, eligible: bool, dangerous: bool, allow_dangerous: bool) -> bool {
+    state == ServerState::Live && eligible && (!dangerous || allow_dangerous)
 }
 
 fn state_response(state: &DaemonState) -> Response {
@@ -195,7 +197,7 @@ pub fn serve(
     let _ = std::fs::remove_file(path);
 
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(failed)?;
+        ensure_state_dir(dir).map_err(failed)?;
     }
 
     let listener = UnixListener::bind(path).map_err(failed)?;
@@ -204,8 +206,41 @@ pub fn serve(
     let router = axum::Router::new().fallback(route).with_state(Arc::new(Control { daemon, registry, reload }));
 
     Ok(tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+
+            if !stream.peer_cred().is_ok_and(|credentials| credentials.uid() == nix::unistd::geteuid().as_raw()) {
+                continue;
+            }
+
+            let app = router.clone();
+            tokio::spawn(async move {
+                let connection = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), hyper_util::service::TowerToHyperService::new(app));
+                let _ = connection.await;
+            });
+        }
     }))
+}
+
+fn ensure_state_dir(dir: &Path) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(dir)?;
+    let metadata = std::fs::metadata(dir)?;
+
+    if metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "state directory belongs to another user",
+        ));
+    }
+
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    Ok(())
 }
 
 pub fn remove_socket() {
@@ -215,6 +250,9 @@ pub fn remove_socket() {
 async fn call(path: &str, method: Method, body: Option<Value>, wait: Duration) -> Option<Value> {
     let exchange = async {
         let stream = UnixStream::connect(socket_path()).await.ok()?;
+        if stream.peer_cred().ok()?.uid() != nix::unistd::geteuid().as_raw() {
+            return None;
+        }
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.ok()?;
         tokio::spawn(connection);
         let request = http::Request::builder()
@@ -270,4 +308,33 @@ pub async fn try_on_daemon(app: &str, tool: &str, arguments: &Value) -> Result<(
         reply.get("ok").and_then(Value::as_bool).unwrap_or(false),
         reply.get("text").and_then(Value::as_str).unwrap_or_default().to_owned(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_state_dir, try_allowed};
+    use crate::links::ServerState;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn control_try_requires_a_live_allowed_read_only_tool_and_danger_permission() {
+        assert!(try_allowed(ServerState::Live, true, false, false));
+        assert!(!try_allowed(ServerState::Starting, true, false, false));
+        assert!(!try_allowed(ServerState::Refused, true, false, false));
+        assert!(!try_allowed(ServerState::Live, false, false, false));
+        assert!(!try_allowed(ServerState::Live, true, true, false));
+        assert!(try_allowed(ServerState::Live, true, true, true));
+    }
+
+    #[test]
+    fn state_directory_permissions_are_tightened() {
+        let directory = std::env::temp_dir().join(format!("porchlight-state-dir-{}", crate::crypto::random_token(6)));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_state_dir(&directory).unwrap();
+
+        assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

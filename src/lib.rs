@@ -1,9 +1,12 @@
 macro_rules! out {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
-
-        if writeln!(std::io::stdout(), $($arg)*).is_err() {
-            std::process::exit(0);
+        if let Err(error) = writeln!(std::io::stdout(), $($arg)*) {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(0);
+            }
+            eprintln!("stdout: {error}");
+            std::process::exit(crate::exit::ExitCode::Internal.value().into());
         }
     }};
 }
@@ -21,6 +24,7 @@ pub mod crypto;
 pub mod daemon;
 pub mod discovery;
 pub mod exit;
+pub mod explain;
 pub mod gateway;
 pub mod links;
 pub mod pages;
@@ -31,6 +35,8 @@ pub mod run;
 pub mod serve;
 pub mod snapshot;
 pub mod sources;
+pub mod spec;
+pub mod state;
 pub mod store;
 pub mod surfaces;
 pub mod system;

@@ -29,6 +29,16 @@ pub struct ClientIdentity {
     pub verified_host: Option<String>,
 }
 
+impl ClientIdentity {
+    #[must_use]
+    pub fn label(&self) -> String {
+        match &self.verified_host {
+            Some(_) => self.name.clone(),
+            None => format!("{} (name not verified)", self.name),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Document {
     redirect_uris: Vec<String>,
@@ -36,7 +46,7 @@ struct Document {
 }
 
 fn private_v4(address: Ipv4Addr) -> bool {
-    let [a, b, ..] = address.octets();
+    let [a, b, c, d] = address.octets();
 
     a == 0
         || a == 10
@@ -45,6 +55,13 @@ fn private_v4(address: Ipv4Addr) -> bool {
         || (a == 169 && b == 254)
         || (a == 172 && (16..32).contains(&b))
         || (a == 192 && b == 168)
+        || (a == 192 && b == 0 && (c == 0 || c == 2))
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224
+        || (a == 255 && b == 255 && c == 255 && d == 255)
 }
 
 fn private_v6(address: Ipv6Addr) -> bool {
@@ -52,11 +69,32 @@ fn private_v6(address: Ipv6Addr) -> bool {
         return private_v4(mapped);
     }
 
-    let first = address.segments().first().copied().unwrap_or_default();
+    let segments = address.segments();
+    let first = segments.first().copied().unwrap_or_default();
+    let second = segments.get(1).copied().unwrap_or_default();
+    let third = segments.get(2).copied().unwrap_or_default();
+    let [second_high, second_low] = second.to_be_bytes();
+    let [third_high, third_low] = third.to_be_bytes();
+    let six_to_four = Ipv4Addr::from([second_high, second_low, third_high, third_low]);
+    let nat64_high = segments.get(6).copied().unwrap_or_default();
+    let nat64_low = segments.get(7).copied().unwrap_or_default();
+    let [nat64_high_high, nat64_high_low] = nat64_high.to_be_bytes();
+    let [nat64_low_high, nat64_low_low] = nat64_low.to_be_bytes();
+    let nat64 = Ipv4Addr::from([nat64_high_high, nat64_high_low, nat64_low_high, nat64_low_low]);
 
-    address.is_unspecified() || address.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+    address.is_unspecified()
+        || address.is_loopback()
+        || (first & 0xe000) != 0x2000
+        || (first & 0xfe00) == 0xfc00
+        || (first & 0xffc0) == 0xfe80
+        || (first & 0xffc0) == 0xfec0
+        || (first & 0xff00) == 0xff00
+        || (first == 0x2001 && second <= 0x01ff)
+        || (first == 0x2001 && second == 0x0db8)
+        || (first == 0x3fff && (second & 0xf000) == 0)
+        || (first == 0x2002 && private_v4(six_to_four))
+        || (first == 0x0064 && second == 0xff9b && private_v4(nat64))
 }
-
 fn is_public(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(v4) => !private_v4(v4),
@@ -107,6 +145,7 @@ async fn download(client_id: &str) -> Option<String> {
     let host = url.host_str()?.trim_start_matches('[').trim_end_matches(']').to_owned();
     let addresses = public_addresses(&host, url.port_or_known_default()?).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(&host, &addresses)
         .timeout(FETCH_TIMEOUT)
@@ -137,10 +176,15 @@ async fn download(client_id: &str) -> Option<String> {
 async fn document_of(client_id: &str) -> Option<Metadata> {
     let text = tokio::time::timeout(FETCH_TIMEOUT, download(client_id)).await.ok()??;
     let document: Document = serde_json::from_str(&text).ok()?;
+
     let host = url::Url::parse(client_id).ok().map(|url| match url.port() {
         Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
         None => url.host_str().unwrap_or_default().to_owned(),
     })?;
+
+    if !document.redirect_uris.iter().all(|uri| is_valid_redirect_uri(uri)) {
+        return None;
+    }
 
     Some(Metadata { host, name: document.client_name, redirect_uris: document.redirect_uris })
 }
@@ -235,5 +279,26 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn special_use_addresses_are_not_public() {
+        for address in [
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0xc000, 0x0201)),
+            IpAddr::V6(Ipv6Addr::new(0x2002, 0xc000, 0x0201, 0, 0, 0, 0, 0)),
+        ] {
+            assert!(!is_public(address));
+        }
+    }
+
+    #[test]
+    fn client_metadata_redirects_use_registration_validation() {
+        assert!(is_valid_redirect_uri("https://client.example/callback"));
+        assert!(!is_valid_redirect_uri("javascript:alert(1)"));
     }
 }

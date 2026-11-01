@@ -1,8 +1,8 @@
 use super::theme::{self, cut, fit};
 use super::{App, Check, ClientRow, DetailRow, ListRow, Mode, TABS, Tab, TunnelRow, plural};
-use crate::core::now_ms;
 use crate::links::ServerState;
-use crate::snapshot::{Badge, LinkInfo, ToolRow, Verdict};
+use crate::policy::Level;
+use crate::snapshot::{LinkInfo, ToolRow, Verdict};
 use crate::tunnels::Provider;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -208,7 +208,7 @@ pub fn draw(app: &App, frame: &mut Frame) {
     match app.tab {
         Tab::Links if app.snap.live.is_none() && app.snap.links.is_empty() => first_run(app, buffer, body),
         Tab::Links => links(app, buffer, body),
-        Tab::Apps => apps(app, buffer, body),
+        Tab::Tools => apps(app, buffer, body),
         Tab::Clients => clients(app, buffer, body),
         Tab::Logs => logs(app, buffer, body),
         Tab::Tunnel => tunnel(app, buffer, body),
@@ -217,27 +217,13 @@ pub fn draw(app: &App, frame: &mut Frame) {
     if let Some(first) = app.snap.pending.first().filter(|_| pending) {
         buffer.set_style(request, Style::new().bg(theme::LAMP));
         let ink = Style::new().fg(theme::NIGHT);
-        let left = vec![
-            span(format!("◉ {} wants {}", first.client, first.link), ink.add_modifier(Modifier::BOLD)),
-            span(
-                format!(
-                    "{} · {} left{}",
-                    first.verified.as_ref().map_or(" · unverified".to_owned(), |host| format!(" · ✓ {host}")),
-                    first.left,
-                    if app.snap.pending.len() > 1 {
-                        format!(" · +{} more", app.snap.pending.len() - 1)
-                    } else {
-                        String::new()
-                    }
-                ),
-                ink,
-            ),
-        ];
+        let left = vec![span(
+            format!("◉ {} wants {} · {} left", first.label(), first.link, first.left),
+            ink.add_modifier(Modifier::BOLD),
+        )];
         let right = vec![
             span("a", ink.add_modifier(Modifier::BOLD)),
-            span(" approve in browser   ", ink),
-            span("c", ink.add_modifier(Modifier::BOLD)),
-            span(" show a code   ", ink),
+            span(" show code   ", ink),
             span("x", ink.add_modifier(Modifier::BOLD)),
             span(" deny ", ink),
         ];
@@ -294,7 +280,7 @@ fn tab_line(app: &App) -> Line<'static> {
         .iter()
         .flat_map(|tab| {
             let badge = match tab {
-                Tab::Apps if problems > 0 => format!(" {problems}"),
+                Tab::Tools if problems > 0 => format!(" {problems}"),
                 Tab::Clients if !app.snap.pending.is_empty() => format!(" {}", app.snap.pending.len()),
                 _ => String::new(),
             };
@@ -328,7 +314,7 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("space", "on/off"),
                 ("enter", "fold"),
                 ("s", "links"),
-                ("d", "remove app"),
+                ("d", "remove tool group"),
                 ("/", "filter"),
                 ("z", "fold all"),
                 ("←", "links"),
@@ -352,13 +338,13 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             _ => vec![
                 ("→", "tools"),
                 ("y", "copy address"),
-                ("e", "apps on link"),
+                ("e", "tools on link"),
                 ("n", "new link"),
                 ("d", "delete"),
                 ("+", "add"),
             ],
         },
-        Tab::Apps => vec![
+        Tab::Tools => vec![
             ("enter", "tools"),
             ("space", "on/off"),
             ("/", "search"),
@@ -369,7 +355,7 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("o", "settings file"),
         ],
         Tab::Clients => match app.client_rows().get(app.clients_cursor) {
-            Some(ClientRow::Pending(_)) => vec![("a", "approve in browser"), ("c", "show a code"), ("x", "deny")],
+            Some(ClientRow::Pending(_)) => vec![("a", "approve here"), ("x", "deny")],
             Some(ClientRow::Client(_)) => {
                 vec![("r", "revoke"), ("l", "its calls"), ("n", "new token"), ("R", "revoke everyone")]
             }
@@ -568,12 +554,12 @@ fn links(app: &App, buffer: &mut Buffer, area: Rect) {
 }
 
 fn badge(tool: &ToolRow) -> Span<'static> {
-    let (text, style) = match tool.badge {
-        Badge::Changes => ("changes things", theme::secondary()),
-        Badge::ReadOnly => ("read-only", theme::dim()),
-        Badge::Resource => ("resource", theme::dim()),
-        Badge::RunsCode => ("▲ runs code", theme::danger()),
-        Badge::Plain => ("", theme::dim()),
+    let (text, style) = match tool.level {
+        Level::RunsCode => ("▲ runs code", theme::danger()),
+        _ if tool.resource => ("resource", theme::dim()),
+        Level::Reads => ("read-only", theme::dim()),
+        Level::Changes => ("changes things", theme::secondary()),
+        Level::ClientChooses => ("client chooses", theme::secondary()),
     };
 
     span(format!("{text:>14}"), style)
@@ -614,7 +600,7 @@ fn link_detail(app: &App, link: &LinkInfo, buffer: &mut Buffer, area: Rect) {
     let secondary = if link.source.is_empty() { clients } else { format!("{} · {clients}", link.source) };
     header.push(spread(
         vec![span(cut(&secondary, width.saturating_sub(24)), theme::dim())],
-        if link.composed { key_hint("e", "apps on this link") } else { vec![] },
+        if link.composed { key_hint("e", "tools on this link") } else { vec![] },
         width,
     ));
     header.push(blank());
@@ -795,11 +781,7 @@ fn apps(app: &App, buffer: &mut Buffer, area: Rect) {
         buffer,
         text_area(area),
         0,
-        &spread(
-            vec![heading(&format!("apps · {}", app.snap.apps.len()))],
-            keys(&[("/", "search"), ("+", "add app")]),
-            width,
-        ),
+        &spread(vec![heading("TOOLS & SERVERS")], keys(&[("/", "search"), ("+", "add")]), width),
     );
     let editing = app.searching == Some(super::Search::Apps);
     let shown = app.app_rows();
@@ -814,7 +796,7 @@ fn apps(app: &App, buffer: &mut Buffer, area: Rect) {
                 span(app.apps_filter.clone(), theme::text()),
                 span(if editing { "█" } else { "" }, theme::text()),
                 span(
-                    format!("   {} of {} · apps and their tools · esc clears", shown.len(), app.snap.apps.len()),
+                    format!("   {} of {} · tools and servers · esc clears", shown.len(), app.snap.apps.len()),
                     theme::dim(),
                 ),
             ]),
@@ -931,7 +913,7 @@ fn clients(app: &App, buffer: &mut Buffer, area: Rect) {
     let client_rows = app.client_rows();
 
     if !app.snap.pending.is_empty() {
-        rows.push(Line::from(span(format!("WAITING FOR YOU · {}", app.snap.pending.len()), theme::lamp())));
+        rows.push(Line::from(span(format!("Waiting · {}", app.snap.pending.len()), theme::lamp())));
         rows.push(blank());
     }
 
@@ -940,20 +922,10 @@ fn clients(app: &App, buffer: &mut Buffer, area: Rect) {
         match row {
             ClientRow::Pending(id) => {
                 let Some(pending) = app.snap.pending.iter().find(|pending| pending.id == *id) else { continue };
-                let verified = match &pending.verified {
-                    Some(host) if *host == pending.client => span("✓ verified", theme::state()),
-                    Some(host) => span(format!("✓ verified {host}"), theme::state()),
-                    None => span("unverified name", theme::danger()),
-                };
-                let asking = format!("{} wants {}", pending.client, pending.link);
-                rows.pick(
-                    spread(
-                        vec![span(fit(&asking, 30), theme::bold()), span("  ", theme::dim()), verified],
-                        vec![span(format!("asked {} · {} left", pending.asked, pending.left), theme::dim())],
-                        width,
-                    ),
-                    chosen,
-                );
+                let asking = format!("{} wants {}", pending.label(), pending.link);
+                let mut right = key_hint("enter", "show code");
+                right.push(span(format!("   {} left", pending.left), theme::dim()));
+                rows.pick(spread(vec![span(cut(&asking, 60), theme::bold())], right, width), chosen);
                 let mut gets = vec![span("will get  ", theme::dim())];
                 for (tool, changes) in pending.tools.iter().take(5) {
                     gets.push(span(tool.clone(), theme::text()));
@@ -1002,12 +974,9 @@ fn clients(app: &App, buffer: &mut Buffer, area: Rect) {
                 );
             }
             ClientRow::NewToken => {
-                if app.snap.clients.is_empty() {
+                if app.snap.clients.is_empty() && app.snap.pending.is_empty() {
                     rows.push(blank());
-                    rows.push(Line::from(span(
-                        "No approved clients yet. Give a client a link from the Links tab, then approve it here.",
-                        theme::dim(),
-                    )));
+                    rows.push(Line::from(span("No approved clients yet.", theme::dim())));
                 }
                 rows.push(blank());
                 rows.pick(
@@ -1254,7 +1223,7 @@ fn tunnel(app: &App, buffer: &mut Buffer, area: Rect) {
             "history",
             vec![
                 span(
-                    cut(&crate::config::in_state_dir("state.db").display().to_string(), width.saturating_sub(42)),
+                    cut(&crate::core::in_state_dir("state.db").display().to_string(), width.saturating_sub(42)),
                     theme::text(),
                 ),
                 span(" · logs kept 90 days", theme::dim()),
@@ -1396,6 +1365,59 @@ fn overlay(app: &App, frame: &mut Frame) {
         Mode::Busy(text) => {
             let area = popup(frame, u16::try_from(text.width() + 10).unwrap_or(60), 5, false);
             fill(frame, area, &[Line::from(vec![span("◌ ", theme::lamp()), span(text.clone(), theme::text())])]);
+        }
+        Mode::Code { id, client, link, copied, .. } => {
+            let Some(pending) = app.snap.pending.iter().find(|pending| pending.id == *id) else { return };
+            let width = 64;
+            let inner = usize::from(width) - 6;
+            let mut cells: Spans = Vec::new();
+            for (index, character) in pending.code.chars().filter(|character| *character != '-').enumerate() {
+                if index == 4 {
+                    cells.push(span("   ", theme::dim()));
+                }
+                cells.push(span(format!(" {character} "), theme::lit_block()));
+                cells.push(span(" ", theme::dim()));
+            }
+            let pad = inner.saturating_sub(width_of(&cells)) / 2;
+            cells.insert(0, span(" ".repeat(pad), theme::dim()));
+            let mut body = vec![
+                title_line(&format!("{client} wants {link}"), "esc", inner, pending.verified.is_none()),
+                blank(),
+                Line::from(span("Type this code on the device that's connecting:", theme::text())),
+                blank(),
+                Line::from(cells),
+                blank(),
+            ];
+            if pending.verified.is_none() {
+                body.extend(wrapped(
+                    &format!("▲ {client}'s name isn't verified. Any app can use it. Share the code only if you just connected it yourself."),
+                    inner,
+                    theme::danger(),
+                ));
+                body.push(blank());
+            }
+            if pending.wrong > 0 {
+                let times = if pending.wrong == 1 { "1 time".to_owned() } else { format!("{} times", pending.wrong) };
+                body.extend(wrapped(
+                    &format!("▲ A wrong code was entered {times}. If that wasn't you, deny this request."),
+                    inner,
+                    theme::danger(),
+                ));
+                body.push(blank());
+            }
+            body.push(spread(
+                vec![span(format!("expires in {}", pending.left), theme::dim())],
+                if *copied {
+                    let mut done = vec![span("✓ copied   ", theme::state())];
+                    done.extend(key_hint("x", "deny"));
+                    done
+                } else {
+                    keys(&[("y", "copy"), ("x", "deny")])
+                },
+                inner,
+            ));
+            let area = popup(frame, width, height_of(&body), false);
+            fill(frame, area, &body);
         }
         Mode::Message { title, lines, danger } => {
             let width = 84;
@@ -1574,40 +1596,6 @@ fn overlay(app: &App, frame: &mut Frame) {
             }
             fill(frame, area, &body);
         }
-        Mode::Code { code, client, verified, until, copied } => {
-            let left = (until - now_ms()).max(0) / 1000;
-            let mut cells: Spans = Vec::new();
-            for (index, character) in code.chars().enumerate() {
-                if index == 4 {
-                    cells.push(span("   ", theme::dim()));
-                }
-                cells.push(span(format!(" {character} "), theme::lit_block()));
-                cells.push(span(" ", theme::dim()));
-            }
-            let width = 56;
-            let inner = usize::from(width) - 6;
-            let pad = inner.saturating_sub(width_of(&cells)) / 2;
-            cells.insert(0, span(" ".repeat(pad), theme::dim()));
-            let mut body = vec![
-                title_line("Approve with a code", "esc", inner, false),
-                Line::from(span(cut(&format!("Type it on the page {client} opened."), inner), theme::dim())),
-                blank(),
-                Line::from(cells),
-                blank(),
-            ];
-            if !verified {
-                body.push(Line::from(span(cut(&format!("▲ {client} isn't verified."), inner), theme::danger())));
-                body.push(Line::from(span("  Only type it if you just added this connector.", theme::danger())));
-                body.push(blank());
-            }
-            body.push(spread(
-                vec![span(format!("expires in {}:{:02}", left / 60, left % 60), theme::dim())],
-                if *copied { vec![span("✓ copied", theme::state())] } else { key_hint("y", "copy") },
-                inner,
-            ));
-            let area = popup(frame, width, height_of(&body), false);
-            fill(frame, area, &body);
-        }
         Mode::Try(state) => {
             let width = 90;
             let inner = usize::from(width) - 6;
@@ -1673,7 +1661,7 @@ fn overlay(app: &App, frame: &mut Frame) {
             let everywhere: &[(&str, &str)] = &[
                 ("tab 1–5", "switch tabs"),
                 ("↑↓ j k", "move · g G top and bottom"),
-                ("a c x", "approve, show a code, deny the waiting request"),
+                ("a x", "approve here, deny the waiting request"),
                 ("q", "quit · porchlight keeps sharing"),
             ];
             let row = |(key, what): &(&str, &str)| {

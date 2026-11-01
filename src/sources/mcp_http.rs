@@ -1,5 +1,6 @@
-use super::{Notices, SourceRequest, UpstreamError};
+use super::{Notices, SourceRequest};
 use crate::core::Tool;
+use crate::rpc::UpstreamError;
 use crate::rpc::{decode_tools_list, list_notification_stream, payloads, text, with_status};
 use axum::body::Body;
 use axum::response::Response;
@@ -9,8 +10,17 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 use std::time::Duration;
 
-const FORWARDED: [&str; 7] =
-    ["accept", "content-type", "last-event-id", "mcp-protocol-version", "mcp-session-id", "origin", "user-agent"];
+const FORWARDED: [&str; 9] = [
+    "accept",
+    "content-type",
+    "last-event-id",
+    "mcp-method",
+    "mcp-name",
+    "mcp-protocol-version",
+    "mcp-session-id",
+    "origin",
+    "user-agent",
+];
 
 pub fn parse_headers(pairs: &[String]) -> IndexMap<String, String> {
     pairs
@@ -182,7 +192,7 @@ impl HttpSource {
         let initialize = json!({
             "protocolVersion": "2025-06-18",
             "capabilities": {},
-            "clientInfo": { "name": "porchlight", "version": "1.0.0" },
+            "clientInfo": { "name": "porchlight", "version": crate::core::VERSION },
         });
         let initialized = self.request("initialize", Some(1), initialize, None, None).await?;
         let negotiated: Value = serde_json::from_str(&initialized.payload)

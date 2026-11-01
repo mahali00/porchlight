@@ -1,65 +1,102 @@
 # porchlight
 
-porchlight shares local MCP servers and command-line tools over HTTPS. Run it on the computer with the tools, then add the address it gives you to your MCP client. You approve the connection on the computer running porchlight.
+A small [CLI + terminal app](#the-cli) and [AI skill](#the-skill) that shares the command-line tools and MCP servers on your computer with MCP clients like Claude, over HTTPS.
 
-It runs on macOS and Linux, with a terminal app and a CLI for adding tools, managing clients, and seeing what they call. [OpenTunnel](https://github.com/anomalyco/opentunnel) handles the tunnel by default, or you can use your own.
+porchlight turns `df -h`, a backup script or a local MCP server into tools that a remote client can call. Nothing is reachable until a person at your computer approves the client.
 
 ![The Links tab with a client waiting for approval](docs/links.png)
 
-## Install
+## Features
 
-```sh
-curl -fsSL https://github.com/mahali00/porchlight/releases/latest/download/install.sh | sh
+- **One command per tool**: `porchlight tools add disk -- df -h`. Everything after `--` is the command, word for word, with no shell.
+- **You approve every client**: a client that asks to connect gets nothing until you type porchlight's code on its device.
+- **Links per audience**: put your home tools on one address and your work tools on another. Each MCP server gets its own.
+- **Safe by default**: commands that hand input to a shell are refused, every tool can be switched off, and every call is logged.
+- **Agent-friendly**: every command takes `--json`, has examples in `--help`, and the [skill](#the-skill) teaches agents the workflow.
+- **No account needed**: [OpenTunnel](https://github.com/anomalyco/opentunnel) gives you a public address, or bring your own domain ([tunnels](skills/porchlight/references/tunnels.md)).
+
+## Installation
+
+```bash
+$ curl -fsSL https://github.com/mahali00/porchlight/releases/latest/download/install.sh | sh
+$ npx skills add mahali00/porchlight
 ```
 
-## Use
+macOS and Linux. The installer checks the download's checksum, and its build attestation when the GitHub CLI (`gh`) is installed. The second line is optional: it gives your coding agent the [skill](#the-skill).
 
-```sh
-porchlight
+## How it works
+
+**1. Share a tool.** Wrap any program. A `{name}` becomes an input the client fills in:
+
+```bash
+$ porchlight tools add disk --read-only -d "Free disk space" -- df -h
+$ porchlight tools add weather --read-only -d "Weather for a city" -- curl -s "wttr.in/{city}?format=3"
+$ porchlight servers add files -- npx -y @modelcontextprotocol/server-filesystem ~/Documents
+$ porchlight servers import          # lists the MCP servers Claude, Cursor and VS Code already use
 ```
 
-Press Enter to start sharing, then `+` in the Apps tab to add an MCP server or command-line tool. Copy an address from the Links tab into your MCP client, then approve the connection on this computer.
+A command that deletes or overwrites things, like `rm {path}`, is never marked read-only, and clients are told it's destructive. When a client chooses its input, a person has to confirm it in a terminal. No input can contain `..`, so `rm ~/Downloads/{name}` can't reach outside `~/Downloads`.
 
-Press `?` for keyboard shortcuts. Sharing keeps running after you close the app. Run `porchlight stop` to stop it.
+**2. Start sharing.** porchlight opens the tunnel and keeps running in the background:
 
-## CLI
-
-Every action in the app is also a command. For example, share a local MCP server or a command-line tool:
-
-```sh
-porchlight apps add notes --url http://127.0.0.1:8080/mcp
-porchlight apps add system --run "uname -a" --reads --link home
-porchlight start
-porchlight links
+```bash
+$ porchlight start
+$ porchlight links list
+● tools        https://porchlight.k2x9.opentunnel.xyz/tools/mcp
+  disk, weather · 2 of 2 tools on · no clients
 ```
 
-Each MCP server gets its own link. Command-line tools go on the links you choose with `--link`.
+**3. Approve the client.** Add the address to your MCP client as a remote MCP server. It opens a page that asks for a code. porchlight shows that code on your computer: in a notification, in the app under Clients, on the home page, or with `porchlight approve`. Type it on the page, whether the client runs on this computer, a phone or another laptop:
 
-```sh
-porchlight status
-porchlight clients
-porchlight clients approve
-porchlight logs
+```bash
+$ porchlight approve
+Code for Claude on tools: EEXR-YFWK
+Type it on the device that's connecting. It expires in 9:41.
 ```
 
-Use `porchlight --help` or `porchlight <command> --help` for all options. Add `--json` for scripts.
+A wrong code keeps the page open and says how many tries are left; after five, the request ends. Only a person at your computer can see the code. Agents and scripts can do everything else.
 
-## Configuration
+TL;DR:
+- Tools are programs you already trust, run as you, without a shell. Each input is one argument.
+- A link is an address plus the tools on it. Change a link's tools and its clients approve again.
+- `porchlight logs` shows every call, `tools disable` turns any tool off, and `clients revoke` takes access away.
 
-Settings live in `~/.porchlight/porchlight.json`. You can edit it by hand, including comments. porchlight reloads it when you save. See [porchlight.schema.json](porchlight.schema.json) for every setting.
+## The CLI
 
-To use your own tunnel, forward it to the local port shown by `porchlight tunnel`, then set its public address:
+Every action in the terminal app (`porchlight` with no command) is also a command:
 
-```sh
-porchlight tunnel use https://mcp.example.com
-```
+| | |
+|---|---|
+| `status` | What's shared, what's waiting, and the next step |
+| `tools` | `list`, `add`, `edit`, `remove`, `enable`, `disable`, `try` |
+| `servers` | `list`, `add`, `remove`, `enable`, `disable` |
+| `links` | `list`, `create`, `edit`, `delete` |
+| `approve` / `deny` | Waiting clients |
+| `clients` / `tokens` | Who has access, and tokens for automations |
+| `start` / `stop` / `tunnel` / `logs` | Service, tunnel and call log |
+
+Full reference: [**CLI**](skills/porchlight/references/cli.md). Run `porchlight <command> --help` for examples.
+
+## The skill
+
+`npx skills add mahali00/porchlight` installs a skill that teaches coding agents to set porchlight up and share tools safely. It's plain Markdown, so it doubles as the manual:
+
+- [**Workflow**](skills/porchlight/SKILL.md#workflow): the steps an agent follows to share something.
+- [**CLI**](skills/porchlight/references/cli.md): every command, option and exit code.
+- [**Configuration**](skills/porchlight/references/configuration.md): `porchlight.json`, including typed inputs, groups, environment and tool rules.
+- [**Tunnels**](skills/porchlight/references/tunnels.md): OpenTunnel, or your own domain with cloudflared or a reverse proxy.
+- [**What porchlight does not guarantee**](skills/porchlight/references/limits.md): what approval protects, and what it doesn't.
 
 ## Development
 
-```sh
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+```bash
+$ cargo fmt --check
+$ cargo clippy --all-targets --locked -- -D warnings
+$ cargo test --locked
 ```
 
-CI runs these checks on macOS and Linux. Pushing a `v*` tag publishes the release binaries and `install.sh`.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).
+
+## License
+
+MIT

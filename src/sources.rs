@@ -3,13 +3,14 @@ pub mod mcp_http;
 pub mod mcp_stdio;
 pub mod process;
 
-use crate::config::log_dir;
+use crate::core::log_dir;
 use crate::core::{Tool, resource_uri};
-use crate::policy::is_dangerous;
+use crate::policy::{Risk, is_dangerous};
+use crate::rpc::{ListChange, UpstreamError};
 use crate::store::Store;
 use axum::response::Response;
 use bytes::Bytes;
-use commands::{CommandSource, CommandTool, CommandsSpec, runs_client_code};
+use commands::{CommandSource, CommandTool, CommandsSpec};
 use futures::stream::BoxStream;
 use http::{HeaderMap, Method};
 use indexmap::{IndexMap, IndexSet};
@@ -17,31 +18,11 @@ use mcp_http::HttpSource;
 use mcp_stdio::{StdioSource, StdioSpec};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, thiserror::Error)]
-#[error("{message}")]
-pub struct UpstreamError {
-    pub message: String,
-}
-
-impl UpstreamError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ListChange {
-    Tools,
-    Resources,
-}
-
-impl ListChange {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Tools => "tools",
-            Self::Resources => "resources",
-        }
-    }
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppSpec {
+    pub name: String,
+    pub source: SourceSpec,
+    pub allow_dangerous: bool,
 }
 
 pub type Notices = Arc<dyn Fn() -> BoxStream<'static, ListChange> + Send + Sync>;
@@ -71,6 +52,28 @@ pub enum SourceSpec {
     Stdio { app: String, command: Vec<String>, env: IndexMap<String, String>, cwd: Option<String> },
 }
 
+pub fn announced_risk(tool: &Tool) -> Risk {
+    let annotations = tool.annotations.as_ref();
+    let properties =
+        tool.input_schema.as_ref().and_then(|schema| schema.get("properties")).and_then(serde_json::Value::as_object);
+    let open = properties
+        .into_iter()
+        .flatten()
+        .filter(|(_, property)| {
+            property.get("enum").is_none() && property.get("type").is_none_or(|kind| kind == "string")
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    Risk {
+        runs_code: is_dangerous(tool),
+        claimed_read_only: annotations.and_then(|annotations| annotations.read_only_hint) == Some(true),
+        effect: (annotations.and_then(|annotations| annotations.destructive_hint) == Some(true))
+            .then_some("can delete or overwrite things"),
+        open,
+    }
+}
+
 impl SourceSpec {
     pub fn refresh(&self) -> bool {
         matches!(self, Self::Http { .. })
@@ -87,12 +90,12 @@ impl SourceSpec {
         }
     }
 
-    pub fn risky(&self, tool: &Tool) -> bool {
+    pub fn risk(&self, tool: &Tool) -> Risk {
         match self {
             Self::Commands { contribution, .. } => {
-                contribution.tools.get(&tool.name).is_some_and(|command| runs_client_code(&command.words))
+                contribution.tools.get(&tool.name).map_or_else(|| announced_risk(tool), CommandTool::risk)
             }
-            _ => is_dangerous(tool),
+            _ => announced_risk(tool),
         }
     }
 

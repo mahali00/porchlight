@@ -141,7 +141,7 @@ pub async fn probe(url: &str) -> bool {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "porchlight", "version": "0.1.0" } },
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "porchlight", "version": crate::core::VERSION } },
     });
     let Ok(client) =
         reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(3)).build()

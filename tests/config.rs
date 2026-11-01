@@ -1,10 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use porchlight::auth::AuthorizationRequest;
-use porchlight::config::Config;
-use porchlight::control::DaemonState;
+use porchlight::config::{Config, Settings};
 use porchlight::crypto::{pkce_challenge, random_token};
 use porchlight::daemon::{Options, Running, start};
+use porchlight::state::DaemonState;
 use porchlight::store::Store;
 use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
@@ -217,12 +217,21 @@ async fn changing_a_links_app_membership_invalidates_approved_codes_before_token
             "203.0.113.9",
         )
         .unwrap();
-    let ticket = auth.issue_ticket("approved-before-membership-change");
-    let approval = auth.approve_with_ticket("approved-before-membership-change", &ticket, Some(&nonce)).unwrap();
+    let code = auth.store().pending_get("approved-before-membership-change").unwrap().unwrap().code;
+    let approval = auth.approve_with_code("approved-before-membership-change", &code, Some(&nonce)).unwrap();
     harness.write(&json!({ "commands": { "a": "echo a", "b": "echo b" }, "links": { "shared": ["b"] } }));
     harness.reload().await;
 
-    assert!(auth.exchange_code(&approval.code, "test-verifier", "https://tunnel.example/shared/mcp").is_err());
+    assert!(
+        auth.exchange_code(
+            &approval.code,
+            "test-verifier",
+            "https://tunnel.example/shared/mcp",
+            "test-client",
+            "https://client.example/callback",
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -314,4 +323,101 @@ async fn edits_keep_the_comments_and_layout_of_porchlight_json() {
     assert!(text.contains("// my lamp"));
     assert!(text.contains("\"lamp/*\": false"));
     assert_eq!(config.load().unwrap().settings.tools.get("lamp/*"), Some(&false));
+}
+
+#[test]
+fn invalid_config_files_are_secured_before_parsing() {
+    let dir = std::env::temp_dir().join(format!("porchlight-invalid-config-{}", random_token(6)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("porchlight.json");
+    std::fs::write(&path, "{").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(Config::at(path.clone()).load().is_err());
+    assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn config_edits_do_not_follow_temp_symlinks_and_write_owner_only_files() {
+    let dir = std::env::temp_dir().join(format!("porchlight-config-temp-{}", random_token(6)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("porchlight.json");
+    let victim = dir.join("victim");
+    let temporary = path.with_extension(format!("json.{}.0.tmp", std::process::id()));
+    std::fs::write(&path, "{}").unwrap();
+    std::fs::write(&victim, "unchanged").unwrap();
+    std::os::unix::fs::symlink(&victim, &temporary).unwrap();
+
+    Config::at(path.clone()).edit(&["tools", "lamp/*"], Some(&json!(false))).unwrap();
+
+    assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
+    assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn concurrent_config_edits_keep_both_changes() {
+    let dir = std::env::temp_dir().join(format!("porchlight-config-lock-{}", random_token(6)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("porchlight.json");
+    std::fs::write(&path, "{}").unwrap();
+    let config = Config::at(path.clone());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let edits = ["lamp/*", "music/*"].map(|key| {
+        let config = config.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            config.edit(&["tools", key], Some(&json!(false))).unwrap();
+        })
+    });
+    barrier.wait();
+    for edit in edits {
+        edit.join().unwrap();
+    }
+
+    let loaded = config.load().unwrap();
+    assert_eq!(loaded.settings.tools.get("lamp/*"), Some(&false));
+    assert_eq!(loaded.settings.tools.get("music/*"), Some(&false));
+}
+
+#[test]
+fn a_missing_config_is_default_but_an_empty_config_is_invalid() {
+    let dir = std::env::temp_dir().join(format!("porchlight-empty-config-{}", random_token(6)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("porchlight.json");
+    let config = Config::at(path.clone());
+
+    assert_eq!(config.load().unwrap().settings, Settings::default());
+    std::fs::write(&path, "").unwrap();
+    assert!(config.load().is_err());
+}
+
+#[test]
+fn splitting_a_tool_out_of_a_group_keeps_the_settings_it_ran_with() {
+    let dir = std::env::temp_dir().join(format!("porchlight-split-{}", random_token(6)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("porchlight.json");
+    std::fs::write(
+        &path,
+        json!({
+            "commands": { "home": {
+                "cwd": "/srv/home",
+                "environment": { "TOKEN": "group", "MODE": "group" },
+                "lights": { "run": "lights {room}", "environment": { "MODE": "own" } },
+                "status": "status"
+            } },
+            "links": { "house": ["home"] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let config = Config::at(path);
+    let settings = config.load().unwrap().settings;
+
+    let name = porchlight::actions::split_tool(&config, &settings, "home", "lights").unwrap();
+    let split = serde_json::to_value(&config.load().unwrap().settings.commands[&name]).unwrap();
+
+    assert_eq!(split["cwd"], "/srv/home");
+    assert_eq!(split["environment"], json!({ "TOKEN": "group", "MODE": "own" }));
+    assert_eq!(split["run"], "lights {room}");
 }
